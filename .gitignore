@@ -1,0 +1,41 @@
+# Data files (too large for git)
+*.h5
+*.hdf5
+*.edf
+*.cbf
+*.tif
+*.tiff
+*.nxs
+*.nx
+
+# Calibration / mask outputs (generated files)
+*.poni
+*.mask
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb~
+
+# Environments
+.env
+.venv/
+env/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
