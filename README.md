@@ -1,28 +1,19 @@
-# xray-data-analysis
+# xray-analysis
 
-Python and shell scripts for X-ray diffraction data analysis developed at the ESRF synchrotron.
+Python scripts for X-ray diffraction and emission data analysis, developed at synchrotron facilities.
 
 ## Repository Structure
 
 ```
-xray-data-analysis/
-├── analysis/       # Peak fitting, integration, and quantitative analysis
-├── pipelines/      # Batch processing and workflow automation (SLURM jobs)
-├── visualization/  # Plotting and pattern visualization
-├── utils/          # Shared utility functions
-├── notebooks/      # Jupyter notebooks
-└── data/           # Small reference files: masks, calibrations
-```
-
-## Requirements
-
-```bash
-pip install -r requirements.txt
+xray-analysis/
+├── laue/           # Laue microdiffraction: peak search, fitting, and tracking
+├── emission/       # Emission analysis: NMF decomposition, spectral fitting, LED statistics
+└── pipelines/      # Batch processing and SLURM job scripts
 ```
 
 ## Usage
 
-Scripts are designed to run on the ESRF computing cluster. See individual script docstrings for usage instructions and required arguments.
+Scripts are designed to run on synchrotron computing clusters. See individual script docstrings for usage instructions and required arguments.
 
 ## Author
 
