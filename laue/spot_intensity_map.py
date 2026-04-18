@@ -6,15 +6,28 @@ given diffraction spot and returns a 2D map of the integrated intensity.  This
 reveals how the intensity of a specific reflection varies across the sample —
 directly related to local strain, mosaicity, and dislocation density.
 
+Normalisation options
+---------------------
+normalize_to_monitor : bool
+    Divides by the monitor counts (incident beam intensity).  Removes beam
+    current fluctuations measured upstream of the sample.
+bg_center / bg_boxsize : tuple
+    Defines a background region on the detector with no diffraction spots.
+    The integrated counts in that region are used to normalise each frame,
+    correcting for detector-level variations (diffuse scattering, gain drift,
+    residual ring-refill effects not captured by the monitor).
+    Applied after monitor normalisation when both are active.
+
 Usage
 -----
 >>> fig = spot_intensity_map(
 ...     h5_path="scan_001.h5",
 ...     img_source="path/to/tifs",
-...     roi_center=(1255, 1390),   # (x, y) detector pixel
-...     roi_boxsize=(50, 60),      # (width, height) in pixels
+...     roi_center=(1255, 1390),
+...     roi_boxsize=(50, 60),
+...     bg_center=(800, 400),      # empty detector region
+...     bg_boxsize=(60, 60),
 ... )
->>> fig.show()
 """
 
 from __future__ import annotations
@@ -31,6 +44,39 @@ from lauexplore.plots.base import _as_grid
 from lauexplore.scan import Scan
 
 
+def _make_slices(center: tuple[int, int], boxsize: tuple[int, int]):
+    cx, cy = center
+    hw, hh = boxsize[0] // 2, boxsize[1] // 2
+    return slice(cy - hh, cy + hh), slice(cx - hw, cx + hw)
+
+
+def _read_h5_roi(img_source: Path, h5_img_key: str, n: int,
+                 row_slice: slice, col_slice: slice) -> np.ndarray:
+    with h5py.File(img_source, "r") as h5f:
+        return h5f[h5_img_key][:n, row_slice, col_slice].astype(float)
+
+
+def _integrate_tifs(img_source: Path, img_prefix: str, img_suffix: str,
+                    img_index_pad: int, n: int, row_slice: slice,
+                    col_slice: slice, workers: int) -> np.ndarray:
+    def _worker(i):
+        fname = img_source / f"{img_prefix}{i:0>{img_index_pad}d}{img_suffix}"
+        return i, float(read_image(fname)[row_slice, col_slice].sum())
+
+    result = np.empty(n)
+    print(f"Loading {n} TIF images ({workers} threads)...")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_worker, i): i for i in range(n)}
+        done = 0
+        for future in as_completed(futures):
+            idx, val = future.result()
+            result[idx] = val
+            done += 1
+            if done % max(1, n // 10) == 0:
+                print(f"  {done}/{n}")
+    return result
+
+
 def spot_intensity_map(
     h5_path: str | Path,
     img_source: str | Path,
@@ -43,6 +89,8 @@ def spot_intensity_map(
     img_index_pad: int = 4,
     h5_img_key: str | None = None,
     normalize_to_monitor: bool = True,
+    bg_center: tuple[int, int] | None = None,
+    bg_boxsize: tuple[int, int] | None = None,
     workers: int = 8,
     figsize: tuple[float, float] = (7, 6),
     cmap: str = "inferno",
@@ -50,42 +98,38 @@ def spot_intensity_map(
 ) -> plt.Figure:
     """Compute and plot the integrated intensity of a diffraction spot across a scan.
 
-    For each scan point, loads the detector image, crops to the ROI centred on
-    the spot, and sums all pixel counts.  The result is a 2D heatmap with the
-    same spatial coordinates as a fluorescence map.
-
-    For HDF5 image sources the entire ROI stack is read in a single operation,
-    which is significantly faster than opening the file once per image.
-    For TIF sources, images are loaded in parallel with a thread pool.
-
     Parameters
     ----------
     h5_path : str or Path
-        Path to the scan HDF5 file (used to read scan geometry and monitor).
+        Path to the scan HDF5 file (scan geometry and monitor data).
     img_source : str or Path
         TIF folder path, or HDF5 file containing detector images.
     roi_center : (x, y)
-        Centre of the ROI in detector pixel coordinates (column, row).
+        Centre of the spot ROI in detector pixel coordinates (column, row).
     roi_boxsize : (width, height)
-        Size of the ROI in pixels (columns, rows).
+        Size of the spot ROI in pixels.
     scan_number : int
         Scan entry number inside the HDF5 (default 1).
     img_prefix, img_suffix, img_index_pad :
         TIF filename format: ``{prefix}{index:0>{pad}d}{suffix}``.
     h5_img_key : str, optional
-        Dataset key inside ``img_source`` when it is an HDF5 file.
-        Dataset shape must be ``(n_images, height, width)``.
+        Dataset key when ``img_source`` is an HDF5 file.
+        Shape must be ``(n_images, height, width)``.
     normalize_to_monitor : bool
-        If True (default), divide integrated intensity by the monitor counts at
-        each scan point, removing synchrotron ring refill artefacts.
+        Divide by monitor counts to correct for incident beam fluctuations
+        (default True).
+    bg_center : (x, y), optional
+        Centre of a background ROI — a detector region with no diffraction
+        spots.  The integrated counts there normalise each frame, correcting
+        for detector-level variations not captured by the monitor (diffuse
+        scattering, gain drift, residual ring-refill artefacts).
+        Applied after monitor normalisation.
+    bg_boxsize : (width, height), optional
+        Size of the background ROI.  Required when ``bg_center`` is set.
     workers : int
-        Number of threads for parallel TIF loading (ignored for HDF5).
-    figsize : (width, height)
-        Figure size in inches.
-    cmap : str
-        Matplotlib colormap (default ``"inferno"``).
-    title : str, optional
-        Figure title.
+        Threads for parallel TIF loading (ignored for HDF5).
+    figsize, cmap, title :
+        Matplotlib figure parameters.
 
     Returns
     -------
@@ -95,55 +139,64 @@ def spot_intensity_map(
     img_source = Path(img_source)
     is_h5      = img_source.suffix in ('.h5', '.hdf5')
 
+    if bg_center is not None and bg_boxsize is None:
+        raise ValueError("bg_boxsize must be set when bg_center is provided.")
+
     scan = Scan.from_h5(h5_path, scan_number)
+    n    = scan.length
 
-    cx, cy    = roi_center
-    hw, hh    = roi_boxsize[0] // 2, roi_boxsize[1] // 2
-    col_slice = slice(cx - hw, cx + hw)
-    row_slice = slice(cy - hh, cy + hh)
+    spot_row, spot_col = _make_slices(roi_center, roi_boxsize)
 
-    # ── Integrate counts per scan point ───────────────────────────────────────
+    # ── Integrate spot ROI ────────────────────────────────────────────────────
     if is_h5:
         if h5_img_key is None:
             raise ValueError("h5_img_key must be set when img_source is an HDF5 file.")
-        # Read the full ROI stack in one shot — much faster than per-image access
-        print("Reading ROI from HDF5...")
-        with h5py.File(img_source, "r") as h5f:
-            crops = h5f[h5_img_key][:scan.length, row_slice, col_slice]
-        intensity = crops.sum(axis=(1, 2)).astype(float)
-
+        print("Reading spot ROI from HDF5...")
+        crops     = _read_h5_roi(img_source, h5_img_key, n, spot_row, spot_col)
+        intensity = crops.sum(axis=(1, 2))
     else:
-        def _integrate(file_index: int) -> tuple[int, float]:
-            fname = img_source / f"{img_prefix}{file_index:0>{img_index_pad}d}{img_suffix}"
-            crop  = read_image(fname)[row_slice, col_slice]
-            return file_index, float(crop.sum())
-
-        intensity = np.empty(scan.length)
-        print(f"Loading {scan.length} TIF images ({workers} threads)...")
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_integrate, i): i for i in range(scan.length)}
-            done = 0
-            for future in as_completed(futures):
-                idx, val = future.result()
-                intensity[idx] = val
-                done += 1
-                if done % max(1, scan.length // 10) == 0:
-                    print(f"  {done}/{scan.length}")
+        intensity = _integrate_tifs(img_source, img_prefix, img_suffix,
+                                    img_index_pad, n, spot_row, spot_col, workers)
 
     # ── Monitor normalisation ─────────────────────────────────────────────────
     if normalize_to_monitor:
-        monitor  = scan.monitor_data.astype(float)
-        monitor  = np.where(monitor == 0, np.nan, monitor)
+        monitor   = np.where(scan.monitor_data == 0, np.nan,
+                             scan.monitor_data.astype(float))
         intensity = intensity / monitor
 
+    # ── Background normalisation ──────────────────────────────────────────────
+    if bg_center is not None:
+        bg_row, bg_col = _make_slices(bg_center, bg_boxsize)
+
+        if is_h5:
+            print("Reading background ROI from HDF5...")
+            bg_crops = _read_h5_roi(img_source, h5_img_key, n, bg_row, bg_col)
+            bg       = bg_crops.sum(axis=(1, 2)).astype(float)
+        else:
+            bg = _integrate_tifs(img_source, img_prefix, img_suffix,
+                                 img_index_pad, n, bg_row, bg_col, workers)
+
+        if normalize_to_monitor:
+            bg = bg / monitor
+
+        bg        = np.where(bg == 0, np.nan, bg)
+        intensity = intensity / bg
+
+    # ── Colorbar label ────────────────────────────────────────────────────────
+    label = "Integrated counts"
+    if normalize_to_monitor:
+        label += " / monitor"
+    if bg_center is not None:
+        label += " / background"
+
     # ── Reshape and plot ──────────────────────────────────────────────────────
-    intensity_grid = _as_grid(intensity, scan)   # (nbypoints, nbxpoints)
-    motor_x        = scan.xpoints * 1e3           # mm → µm
-    motor_y        = scan.ypoints * 1e3           # mm → µm
+    intensity_grid = _as_grid(intensity, scan)
+    motor_x        = scan.xpoints * 1e3
+    motor_y        = scan.ypoints * 1e3
 
     fig, ax = plt.subplots(figsize=figsize)
     mesh = ax.pcolormesh(motor_x, motor_y, intensity_grid, cmap=cmap, shading="auto")
-    plt.colorbar(mesh, ax=ax, label="Integrated counts" + (" / monitor" if normalize_to_monitor else ""))
+    plt.colorbar(mesh, ax=ax, label=label)
     ax.set_aspect("equal")
     ax.set_xlabel("Position [μm]")
     ax.set_ylabel("Position [μm]")
