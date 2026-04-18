@@ -50,7 +50,7 @@ def scan_viewer(
     roi_x: slice | None = None,
     *,
     scan_number: int = 1,
-    img_prefix: str = "",
+    img_prefix: str = "img_",
     img_suffix: str = ".tif",
     img_index_pad: int = 4,
     h5_img_key: str | None = None,
