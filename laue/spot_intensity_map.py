@@ -11,22 +11,35 @@ Normalisation options
 normalize_to_monitor : bool
     Divides by the monitor counts (incident beam intensity).  Removes beam
     current fluctuations measured upstream of the sample.
+
 bg_center / bg_boxsize : tuple
-    Defines a background region on the detector with no diffraction spots.
-    The integrated counts in that region are used to normalise each frame,
-    correcting for detector-level variations (diffuse scattering, gain drift,
-    residual ring-refill effects not captured by the monitor).
-    Applied after monitor normalisation when both are active.
+    Defines a reference ROI used to normalise each frame.  Applied after
+    monitor normalisation when both are active.
+
+    Two strategies, in increasing effectiveness:
+
+    1. Empty detector region (no diffraction spots)
+       Corrects for detector-level variations: diffuse scattering, gain
+       drift, residual ring-refill artefacts not captured by the monitor.
+
+    2. Substrate spot of the same reflection family  ← recommended
+       The substrate and epitaxial layer are illuminated by the same beam
+       at the same sample point simultaneously.  Any intensity variation
+       (ring refill, beam fluctuation, monitor drift) affects both spots
+       equally and cancels in the ratio.  The result is a map of
+       ``I_layer / I_substrate``, which reflects only real structural
+       variations in the epitaxial layer: local mosaicity, strain, and
+       dislocation density — free of instrumental artefacts.
 
 Usage
 -----
 >>> fig = spot_intensity_map(
 ...     h5_path="scan_001.h5",
 ...     img_source="path/to/tifs",
-...     roi_center=(1255, 1390),
-...     roi_boxsize=(50, 60),
-...     bg_center=(800, 400),      # empty detector region
-...     bg_boxsize=(60, 60),
+...     roi_center=(1255, 1390),   # epitaxial layer spot
+...     roi_boxsize=(20, 20),
+...     bg_center=(1255, 1500),    # same reflection in substrate
+...     bg_boxsize=(20, 20),
 ... )
 """
 
@@ -38,6 +51,7 @@ from pathlib import Path
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 from lauexplore.image import read as read_image
 from lauexplore.plots.base import _as_grid
@@ -64,16 +78,13 @@ def _integrate_tifs(img_source: Path, img_prefix: str, img_suffix: str,
         return i, float(read_image(fname)[row_slice, col_slice].sum())
 
     result = np.empty(n)
-    print(f"Loading {n} TIF images ({workers} threads)...")
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_worker, i): i for i in range(n)}
-        done = 0
-        for future in as_completed(futures):
-            idx, val = future.result()
-            result[idx] = val
-            done += 1
-            if done % max(1, n // 10) == 0:
-                print(f"  {done}/{n}")
+        with tqdm(total=n, desc="Loading TIFs", unit="img") as pbar:
+            for future in as_completed(futures):
+                idx, val = future.result()
+                result[idx] = val
+                pbar.update(1)
     return result
 
 
@@ -119,11 +130,14 @@ def spot_intensity_map(
         Divide by monitor counts to correct for incident beam fluctuations
         (default True).
     bg_center : (x, y), optional
-        Centre of a background ROI — a detector region with no diffraction
-        spots.  The integrated counts there normalise each frame, correcting
-        for detector-level variations not captured by the monitor (diffuse
-        scattering, gain drift, residual ring-refill artefacts).
-        Applied after monitor normalisation.
+        Centre of the reference ROI used to normalise each frame.
+        Two recommended choices (see module docstring):
+        (a) an empty detector region with no diffraction spots, or
+        (b) a substrate spot of the same reflection family as ``roi_center``
+            — the preferred option, as it cancels all instrumental artefacts
+            (ring refill, beam fluctuations) and yields a pure
+            ``I_layer / I_substrate`` ratio map.
+        Applied after monitor normalisation when both are active.
     bg_boxsize : (width, height), optional
         Size of the background ROI.  Required when ``bg_center`` is set.
     workers : int
@@ -151,7 +165,6 @@ def spot_intensity_map(
     if is_h5:
         if h5_img_key is None:
             raise ValueError("h5_img_key must be set when img_source is an HDF5 file.")
-        print("Reading spot ROI from HDF5...")
         crops     = _read_h5_roi(img_source, h5_img_key, n, spot_row, spot_col)
         intensity = crops.sum(axis=(1, 2))
     else:
@@ -169,7 +182,6 @@ def spot_intensity_map(
         bg_row, bg_col = _make_slices(bg_center, bg_boxsize)
 
         if is_h5:
-            print("Reading background ROI from HDF5...")
             bg_crops = _read_h5_roi(img_source, h5_img_key, n, bg_row, bg_col)
             bg       = bg_crops.sum(axis=(1, 2)).astype(float)
         else:
