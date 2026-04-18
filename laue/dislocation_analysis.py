@@ -15,6 +15,9 @@ and unaffected, as if the dislocation were not present.
     g·b = ±1       →  weak contrast
     g·b = ±2, ±3   →  strong contrast — spot clearly perturbed
 
+The sign of g·b indicates the direction of the lattice displacement relative
+to g, but does not affect contrast intensity. In Laue, only |g·b| matters.
+
 Identifying a dislocation type experimentally relies on finding pairs of
 reflections where the effect appears (g·b ≠ 0) and disappears (g·b = 0).
 
@@ -34,9 +37,14 @@ Typical workflow
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    import matplotlib.figure
 
 
 # ── Index conversion ──────────────────────────────────────────────────────────
@@ -285,4 +293,151 @@ def plot_contrast(
         width=width,
         height=height,
     )
+    return fig
+
+
+# ── Interactive comparison with experimental image ────────────────────────────
+
+def plot_contrast_with_experiment(
+    spots: pd.DataFrame,
+    dislocation_label: str,
+    experimental_image: np.ndarray | str | Path,
+    *,
+    component: str = "gb",
+    zoom_boxsize: tuple[int, int] = (100, 100),
+    h5_img_key: str | None = None,
+    overlay_spots: bool = True,
+    figsize: tuple[float, float] = (14, 7),
+    cmap_exp: str = "gray",
+) -> "matplotlib.figure.Figure":
+    """Side-by-side view of simulated contrast and experimental detector image.
+
+    Left panel: simulated spot positions coloured by g·b (or g·(b×u)).
+    Right panel: experimental detector image.
+
+    Clicking on a spot in the left panel zooms the right panel to a region of
+    ``zoom_boxsize`` pixels centred on that spot's detector coordinates (X, Y).
+    If ``overlay_spots`` is True, simulated spot positions are also drawn on
+    the experimental image for direct comparison.
+
+    Requires the ``%matplotlib widget`` (ipympl) backend in Jupyter.
+
+    Parameters
+    ----------
+    spots : pd.DataFrame
+        Output of ``dislocation_contrast`` (must contain X, Y, h, k, l columns).
+    dislocation_label : str
+        The label used when calling ``dislocation_contrast``.
+    experimental_image : np.ndarray, str, or Path
+        Detector image as a numpy array, a TIF/EDF file path, or an HDF5 file
+        path (requires ``h5_img_key``).
+    component : {"gb", "gbu"}
+        Column to use for colour coding in the simulation panel.
+    zoom_boxsize : (width, height)
+        Size of the zoom region in the experimental panel (pixels).
+    h5_img_key : str, optional
+        Dataset key when ``experimental_image`` is an HDF5 file.
+        Indexed as ``h5f[h5_img_key][...]``.
+    overlay_spots : bool
+        If True, draw simulated spot positions on the experimental image.
+    figsize : (width, height)
+        Figure size in inches.
+    cmap_exp : str
+        Matplotlib colormap for the experimental image.
+    """
+    import h5py
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    from lauexplore.image import read as read_image
+
+    col = f"{dislocation_label}_{component}"
+    if col not in spots.columns:
+        raise KeyError(
+            f"Column '{col}' not found. "
+            f"Run dislocation_contrast with label='{dislocation_label}' first."
+        )
+
+    # ── Load experimental image ───────────────────────────────────────────────
+    if isinstance(experimental_image, np.ndarray):
+        exp_img = experimental_image
+    else:
+        src = Path(experimental_image)
+        if src.suffix in ('.h5', '.hdf5'):
+            if h5_img_key is None:
+                raise ValueError("h5_img_key must be set when experimental_image is an HDF5 file.")
+            with h5py.File(src, "r") as h5f:
+                exp_img = h5f[h5_img_key][()]
+        else:
+            exp_img = read_image(src)
+
+    img_h, img_w = exp_img.shape[:2]
+
+    # ── Colour mapping for g·b ────────────────────────────────────────────────
+    z        = spots[col].to_numpy(dtype=float)
+    abs_max  = float(np.abs(z).max()) or 1.0
+    norm     = mcolors.TwoSlopeNorm(vmin=-abs_max, vcenter=0, vmax=abs_max)
+    cmap_sim = plt.get_cmap("RdBu")
+
+    # ── Figure layout ─────────────────────────────────────────────────────────
+    fig, (ax_sim, ax_exp) = plt.subplots(1, 2, figsize=figsize)
+
+    # Left: simulated spots
+    sc = ax_sim.scatter(
+        spots["X"], spots["Y"],
+        c=z, cmap=cmap_sim, norm=norm,
+        s=30, linewidths=0.3, edgecolors="k",
+    )
+    plt.colorbar(sc, ax=ax_sim, label=col)
+    ax_sim.set_xlim(0, img_w)
+    ax_sim.set_ylim(img_h, 0)
+    ax_sim.set_xlabel("X (pixels)")
+    ax_sim.set_ylabel("Y (pixels)")
+    ax_sim.set_title(f"Simulation — {col}")
+    ax_sim.set_aspect("equal")
+
+    # Right: experimental image (full view initially)
+    img_vmax = float(np.percentile(exp_img, 99))
+    ax_exp.imshow(exp_img, cmap=cmap_exp, vmin=0, vmax=img_vmax,
+                  origin="upper", extent=[0, img_w, img_h, 0])
+    if overlay_spots:
+        ax_exp.scatter(spots["X"], spots["Y"],
+                       c=z, cmap=cmap_sim, norm=norm,
+                       s=20, linewidths=0.3, edgecolors="w", alpha=0.7)
+    ax_exp.set_xlabel("X (pixels)")
+    ax_exp.set_ylabel("Y (pixels)")
+    ax_exp.set_title("Experimental — click a spot to zoom")
+    ax_exp.set_aspect("equal")
+
+    # Annotation showing spot info
+    info = ax_sim.text(
+        0.02, 0.98, "", transform=ax_sim.transAxes,
+        va="top", ha="left", fontsize=9,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.8),
+    )
+
+    # ── Click handler ─────────────────────────────────────────────────────────
+    spot_xy = spots[["X", "Y"]].to_numpy(dtype=float)
+    hw, hh  = zoom_boxsize[0] / 2, zoom_boxsize[1] / 2
+
+    def _on_click(event):
+        if event.inaxes is not ax_sim or event.button != 1:
+            return
+
+        dists = np.hypot(spot_xy[:, 0] - event.xdata,
+                         spot_xy[:, 1] - event.ydata)
+        i     = int(np.argmin(dists))
+        row   = spots.iloc[i]
+        cx, cy = row["X"], row["Y"]
+
+        ax_exp.set_xlim(cx - hw, cx + hw)
+        ax_exp.set_ylim(cy + hh, cy - hh)
+
+        h_, k_, l_ = int(row["h"]), int(row["k"]), int(row["l"])
+        gb_val     = row[col]
+        info.set_text(f"({h_} {k_} {l_})  {col} = {gb_val:.3f}")
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("button_press_event", _on_click)
+    fig.tight_layout()
+
     return fig
