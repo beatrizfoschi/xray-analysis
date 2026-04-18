@@ -309,6 +309,9 @@ def plot_contrast_with_experiment(
     overlay_spots: bool = True,
     figsize: tuple[float, float] = (14, 7),
     cmap_exp: str = "gray",
+    vmin_pct: float = 0.0,
+    vmax_pct: float = 99.0,
+    
 ) -> "matplotlib.figure.Figure":
     """Side-by-side view of simulated contrast and experimental detector image.
 
@@ -396,8 +399,9 @@ def plot_contrast_with_experiment(
     ax_sim.set_aspect("equal")
 
     # Right: experimental image (full view initially)
-    img_vmax = float(np.percentile(exp_img, 99))
-    ax_exp.imshow(exp_img, cmap=cmap_exp, vmin=0, vmax=img_vmax,
+    img_vmin = float(np.percentile(exp_img, vmin_pct))
+    img_vmax = float(np.percentile(exp_img, vmax_pct))
+    ax_exp.imshow(exp_img, cmap=cmap_exp, vmin=img_vmin, vmax=img_vmax,
                   origin="upper", extent=[0, img_w, img_h, 0])
     if overlay_spots:
         ax_exp.scatter(spots["X"], spots["Y"],
