@@ -311,6 +311,7 @@ def plot_contrast_with_experiment(
     cmap_exp: str = "gray",
     vmin_pct: float = 0.0,
     vmax_pct: float = 99.0,
+    tol: float = 1e-6,
     
 ) -> "matplotlib.figure.Figure":
     """Side-by-side view of simulated contrast and experimental detector image.
@@ -420,25 +421,53 @@ def plot_contrast_with_experiment(
     )
 
     # ── Click handler ─────────────────────────────────────────────────────────
-    spot_xy = spots[["X", "Y"]].to_numpy(dtype=float)
-    hw, hh  = zoom_boxsize[0] / 2, zoom_boxsize[1] / 2
+    # Harmonics share the same (X, Y) position on the detector. We collect all
+    # spots within `harmonic_tol` pixels of the click and display all of them.
+    spot_xy      = spots[["X", "Y"]].to_numpy(dtype=float)
+    hw, hh       = zoom_boxsize[0] / 2, zoom_boxsize[1] / 2
+    harmonic_tol = 3.0   # pixels — spots closer than this are treated as overlapping
 
     def _on_click(event):
         if event.inaxes is not ax_sim or event.button != 1:
             return
 
-        dists = np.hypot(spot_xy[:, 0] - event.xdata,
-                         spot_xy[:, 1] - event.ydata)
-        i     = int(np.argmin(dists))
-        row   = spots.iloc[i]
-        cx, cy = row["X"], row["Y"]
+        dists   = np.hypot(spot_xy[:, 0] - event.xdata,
+                           spot_xy[:, 1] - event.ydata)
+        nearest = int(np.argmin(dists))
+        cx, cy  = spot_xy[nearest]
 
+        # Zoom experimental image to the clicked position
         ax_exp.set_xlim(cx - hw, cx + hw)
         ax_exp.set_ylim(cy + hh, cy - hh)
 
-        h_, k_, l_ = int(row["h"]), int(row["k"]), int(row["l"])
-        gb_val     = row[col]
-        info.set_text(f"({h_} {k_} {l_})  {col} = {gb_val:.3f}")
+        # Collect all harmonics at this position (sorted by energy = fundamental first)
+        overlapping = spots[dists <= harmonic_tol].sort_values("Energy")
+        gb_vals     = overlapping[col].to_numpy(dtype=float)
+        visible     = np.abs(gb_vals) > tol
+
+        lines = []
+        for i_row, (_, row) in enumerate(overlapping.iterrows()):
+            h_, k_, l_ = int(row["h"]), int(row["k"]), int(row["l"])
+            marker = " ← fundamental" if i_row == 0 else ""
+            lines.append(
+                f"({h_:2d} {k_:2d} {l_:2d})  "
+                f"E={row['Energy']:.2f} keV  "
+                f"{col}={row[col]:.3f}{marker}"
+            )
+
+        lines.append("─" * 38)
+
+        gb_dominant = gb_vals[0]
+        if all(visible):
+            summary = "All harmonics visible"
+        elif not any(visible):
+            summary = "All harmonics invisible"
+        else:
+            n_vis = visible.sum()
+            summary = f"Mixed: {n_vis}/{len(visible)} harmonics visible"
+
+        lines.append(f"{summary}  |  gb dominant = {gb_dominant:.3f}")
+        info.set_text("\n".join(lines))
         fig.canvas.draw_idle()
 
     fig.canvas.mpl_connect("button_press_event", _on_click)
