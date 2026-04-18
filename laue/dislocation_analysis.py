@@ -4,6 +4,20 @@ dislocation_analysis.py — Laue dislocation contrast analysis.
 Simulates Laue diffraction patterns and computes the invisibility criteria
 (g·b and g·(b×u)) for user-defined dislocation types.
 
+Interpreting g·b
+----------------
+A dislocation with Burgers vector b produces contrast in a diffraction spot g
+only when g·b ≠ 0. When g·b = 0, the lattice distortion caused by the
+dislocation leaves no signature in that reflection — the spot appears sharp
+and unaffected, as if the dislocation were not present.
+
+    g·b = 0        →  dislocation invisible — spot unaffected
+    g·b = ±1       →  weak contrast
+    g·b = ±2, ±3   →  strong contrast — spot clearly perturbed
+
+Identifying a dislocation type experimentally relies on finding pairs of
+reflections where the effect appears (g·b ≠ 0) and disappears (g·b = 0).
+
 Typical workflow
 ----------------
 >>> spots  = simulate_laue("GaN", ub_matrix, calib_params, Emin=5, Emax=25)
