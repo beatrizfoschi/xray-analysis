@@ -305,14 +305,12 @@ def plot_contrast_with_experiment(
     *,
     component: str = "gb",
     zoom_boxsize: tuple[int, int] = (100, 100),
-    h5_img_key: str | None = None,
     overlay_spots: bool = True,
     figsize: tuple[float, float] = (14, 7),
     cmap_exp: str = "gray",
     vmin_pct: float = 0.0,
     vmax_pct: float = 99.0,
     tol: float = 1e-6,
-    
 ) -> "matplotlib.figure.Figure":
     """Side-by-side view of simulated contrast and experimental detector image.
 
@@ -333,15 +331,11 @@ def plot_contrast_with_experiment(
     dislocation_label : str
         The label used when calling ``dislocation_contrast``.
     experimental_image : np.ndarray, str, or Path
-        Detector image as a numpy array, a TIF/EDF file path, or an HDF5 file
-        path (requires ``h5_img_key``).
+        Detector image as a 2D numpy array or a TIF/EDF file path.
     component : {"gb", "gbu"}
         Column to use for colour coding in the simulation panel.
     zoom_boxsize : (width, height)
         Size of the zoom region in the experimental panel (pixels).
-    h5_img_key : str, optional
-        Dataset key when ``experimental_image`` is an HDF5 file.
-        Indexed as ``h5f[h5_img_key][...]``.
     overlay_spots : bool
         If True, draw simulated spot positions on the experimental image.
     figsize : (width, height)
@@ -349,7 +343,6 @@ def plot_contrast_with_experiment(
     cmap_exp : str
         Matplotlib colormap for the experimental image.
     """
-    import h5py
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
     from lauexplore.image import read as read_image
@@ -365,14 +358,7 @@ def plot_contrast_with_experiment(
     if isinstance(experimental_image, np.ndarray):
         exp_img = experimental_image
     else:
-        src = Path(experimental_image)
-        if src.suffix in ('.h5', '.hdf5'):
-            if h5_img_key is None:
-                raise ValueError("h5_img_key must be set when experimental_image is an HDF5 file.")
-            with h5py.File(src, "r") as h5f:
-                exp_img = h5f[h5_img_key][()]
-        else:
-            exp_img = read_image(src)
+        exp_img = read_image(Path(experimental_image))
 
     img_h, img_w = exp_img.shape[:2]
 

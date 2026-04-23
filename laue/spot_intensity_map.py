@@ -64,10 +64,21 @@ def _make_slices(center: tuple[int, int], boxsize: tuple[int, int]):
     return slice(cy - hh, cy + hh), slice(cx - hw, cx + hw)
 
 
-def _read_h5_roi(img_source: Path, h5_img_key: str, n: int,
-                 row_slice: slice, col_slice: slice) -> np.ndarray:
-    with h5py.File(img_source, "r") as h5f:
-        return h5f[h5_img_key][:n, row_slice, col_slice].astype(float)
+def _integrate_h5_roi(img_source: Path, h5_img_key: str, n: int,
+                      row_slice: slice, col_slice: slice, workers: int) -> np.ndarray:
+    def _worker(i):
+        with h5py.File(img_source, "r") as h5f:
+            return i, float(h5f[h5_img_key][i, row_slice, col_slice].sum())
+
+    result = np.empty(n)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_worker, i): i for i in range(n)}
+        with tqdm(total=n, desc="Loading H5 frames", unit="img") as pbar:
+            for future in as_completed(futures):
+                idx, val = future.result()
+                result[idx] = val
+                pbar.update(1)
+    return result
 
 
 def _integrate_tifs(img_source: Path, img_prefix: str, img_suffix: str,
@@ -141,7 +152,7 @@ def spot_intensity_map(
     bg_boxsize : (width, height), optional
         Size of the background ROI.  Required when ``bg_center`` is set.
     workers : int
-        Threads for parallel TIF loading (ignored for HDF5).
+        Threads for parallel image loading (TIF and HDF5).
     figsize, cmap, title :
         Matplotlib figure parameters.
 
@@ -165,8 +176,7 @@ def spot_intensity_map(
     if is_h5:
         if h5_img_key is None:
             raise ValueError("h5_img_key must be set when img_source is an HDF5 file.")
-        crops     = _read_h5_roi(img_source, h5_img_key, n, spot_row, spot_col)
-        intensity = crops.sum(axis=(1, 2))
+        intensity = _integrate_h5_roi(img_source, h5_img_key, n, spot_row, spot_col, workers)
     else:
         intensity = _integrate_tifs(img_source, img_prefix, img_suffix,
                                     img_index_pad, n, spot_row, spot_col, workers)
@@ -182,8 +192,7 @@ def spot_intensity_map(
         bg_row, bg_col = _make_slices(bg_center, bg_boxsize)
 
         if is_h5:
-            bg_crops = _read_h5_roi(img_source, h5_img_key, n, bg_row, bg_col)
-            bg       = bg_crops.sum(axis=(1, 2)).astype(float)
+            bg = _integrate_h5_roi(img_source, h5_img_key, n, bg_row, bg_col, workers)
         else:
             bg = _integrate_tifs(img_source, img_prefix, img_suffix,
                                  img_index_pad, n, bg_row, bg_col, workers)
