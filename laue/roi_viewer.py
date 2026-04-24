@@ -51,6 +51,7 @@ def roi_viewer(
     workers: int = 8,
     cmap: str = "hot",
     figsize: tuple[float, float] = (11, 5),
+    save_h5: str | Path | None = None,
 ) -> tuple[plt.Figure, widgets.Widget]:
     """Interactive ROI viewer across a Laue image sequence.
 
@@ -80,6 +81,9 @@ def roi_viewer(
         Matplotlib colormap (default ``"hot"``).
     figsize : (width, height)
         Figure size in inches.
+    save_h5 : str or Path, optional
+        If provided, saves all ROI frames to an HDF5 file at this path.
+        Dataset ``rois`` has shape ``(n_images, 2*boxsize+1, 2*boxsize+1)``.
 
     Returns
     -------
@@ -140,6 +144,29 @@ def roi_viewer(
         sample_maxima = list(pool.map(lambda i: _load_roi(i).max(), sample_idx))
     vmax_global = float(np.percentile(sample_maxima, 95))
     print(f"Scale: 0 – {vmax_global:.0f} counts")
+
+    # ── Save ROIs to HDF5 ─────────────────────────────────────────────────────
+    if save_h5 is not None:
+        from concurrent.futures import as_completed
+        from tqdm import tqdm
+
+        save_h5 = Path(save_h5)
+        roi_size = 2 * boxsize + 1
+        print(f"Saving {n_imgs} ROI frames to {save_h5} ...")
+        rois = np.empty((n_imgs, roi_size, roi_size), dtype=np.float32)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_load_roi, i): i for i in range(n_imgs)}
+            with tqdm(total=n_imgs, desc="Saving ROIs", unit="img") as pbar:
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    rois[idx] = future.result()
+                    pbar.update(1)
+        with h5py.File(save_h5, "w") as h5f:
+            ds = h5f.create_dataset("rois", data=rois, compression="gzip")
+            ds.attrs["roi_center"] = roi_center
+            ds.attrs["boxsize"] = boxsize
+            ds.attrs["coords"] = coords
+        print(f"Saved → {save_h5}")
 
     # ── Widgets ───────────────────────────────────────────────────────────────
     slider  = widgets.IntSlider(
