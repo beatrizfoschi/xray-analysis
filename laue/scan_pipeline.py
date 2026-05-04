@@ -156,8 +156,9 @@ def run_pipeline(
     coords : {"xmas", "numpy"}
         Coordinate convention for roi_center.
     scan_subset : (i0, i1, j0, j1) or None
-        Grid index range: i = column index (0..nbxpoints-1),
-                          j = row index    (0..nbypoints-1).
+        Grid index range following lauexplore's convention (NOT numpy row/col):
+          i = column index, x direction  (0..nbxpoints-1)
+          j = row/line index, y direction (0..nbypoints-1)
         None = full scan.
     workers : int
         Number of parallel threads for H5 reading.
@@ -179,6 +180,24 @@ def run_pipeline(
     cen_col = (x - 1) if coords == "xmas" else x
     cen_row = (y - 1) if coords == "xmas" else y
 
+    # Pre-compute ROI row/col slices (clamped to detector bounds)
+    # We read only the ROI region from the H5 — not the full frame.
+    with h5py.File(img_source, "r") as h5f:
+        _, H, W = h5f[h5_img_key].shape
+    r0_src = max(0, cen_row - boxsize)
+    r1_src = min(H, cen_row + boxsize + 1)
+    c0_src = max(0, cen_col - boxsize)
+    c1_src = min(W, cen_col + boxsize + 1)
+    row_slice = slice(r0_src, r1_src)
+    col_slice = slice(c0_src, c1_src)
+
+    # Padding needed if ROI extends outside the detector
+    pad_top    = max(0, boxsize - cen_row)
+    pad_bottom = max(0, (cen_row + boxsize + 1) - H)
+    pad_left   = max(0, boxsize - cen_col)
+    pad_right  = max(0, (cen_col + boxsize + 1) - W)
+    needs_pad  = any([pad_top, pad_bottom, pad_left, pad_right])
+
     # Subset bounds
     if scan_subset is not None:
         i0, i1, j0, j1 = scan_subset
@@ -195,12 +214,14 @@ def run_pipeline(
     print(f"Running pipeline on {n_pos} positions  ({i1-i0} × {j1-j0})...")
 
     def _process_one(ij: tuple[int, int]) -> dict:
-        i, j   = ij
-        idx    = scan.ij_to_index(i, j)
+        i, j       = ij
+        idx        = scan.ij_to_index(i, j)
         x_um, y_um = scan.ij_to_xy(i, j)   # returns (x, y) in mm
+        # Hyperslab read: transfer only the ROI region, not the full frame
         with h5py.File(img_source, "r") as h5f:
-            frame = h5f[h5_img_key][idx].astype(np.float64)
-        roi     = _crop_roi(frame, cen_row, cen_col, boxsize)
+            roi = h5f[h5_img_key][idx, row_slice, col_slice].astype(np.float64)
+        if needs_pad:
+            roi = np.pad(roi, ((pad_top, pad_bottom), (pad_left, pad_right)))
         metrics = analyze_spot(roi, **spot_kwargs)
         return {
             "i":         i,
