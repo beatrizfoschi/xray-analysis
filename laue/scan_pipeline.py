@@ -133,6 +133,7 @@ def run_pipeline(
     boxsize:       int,
     *,
     h5_img_key:    str = "frames",
+    direct_h5_key: str = "entry_0000/CRGIF/eiger4m/data",
     coords:        str = "xmas",        # "xmas" (1-based) or "numpy" (0-based)
     scan_subset:   tuple[int, int, int, int] | None = None,
     workers:       int = 8,
@@ -143,7 +144,10 @@ def run_pipeline(
     Parameters
     ----------
     img_source : Path
-        Virtual stack H5 (or any H5 with shape ``(n_frames, H, W)``).
+        Either:
+        - A directory containing one H5 file per frame (direct mode — fastest).
+          Files are sorted alphabetically; index 0 = first file.
+        - A single H5 file with shape ``(n_frames, H, W)`` (virtual stack mode).
     scan : lauexplore.scan.Scan
         Scan object providing grid geometry and index ↔ (i, j) mapping.
     roi_center : (x, y)
@@ -152,7 +156,10 @@ def run_pipeline(
     boxsize : int
         Half-side of the ROI crop.
     h5_img_key : str
-        Dataset key inside img_source (default "frames").
+        Dataset key when reading from a virtual/stacked H5 file (default "frames").
+    direct_h5_key : str
+        Dataset key inside each individual H5 file when img_source is a folder
+        (default Eiger key "entry_0000/CRGIF/eiger4m/data").
     coords : {"xmas", "numpy"}
         Coordinate convention for roi_center.
     scan_subset : (i0, i1, j0, j1) or None
@@ -174,16 +181,30 @@ def run_pipeline(
         streak_D50, streak_D95, core_tail_ratio
     """
     img_source = Path(img_source)
+    direct_mode = img_source.is_dir()
 
     # Coordinate conversion
     x, y    = roi_center
     cen_col = (x - 1) if coords == "xmas" else x
     cen_row = (y - 1) if coords == "xmas" else y
 
-    # Pre-compute ROI row/col slices (clamped to detector bounds)
-    # We read only the ROI region from the H5 — not the full frame.
-    with h5py.File(img_source, "r") as h5f:
-        _, H, W = h5f[h5_img_key].shape
+    # Resolve file list and detector shape
+    if direct_mode:
+        files = sorted(img_source.glob("*.h5"))
+        if not files:
+            raise FileNotFoundError(f"No .h5 files found in {img_source}")
+        with h5py.File(files[0], "r") as h5f:
+            src_shape = h5f[direct_h5_key].shape   # (1, H, W) or (H, W)
+        squeeze = len(src_shape) == 3
+        H, W    = src_shape[-2], src_shape[-1]
+        print(f"Direct mode: {len(files)} files, detector {H}×{W}")
+    else:
+        files  = None
+        squeeze = False
+        with h5py.File(img_source, "r") as h5f:
+            _, H, W = h5f[h5_img_key].shape
+
+    # Pre-compute clamped ROI slices (read only ROI pixels, not the full frame)
     r0_src = max(0, cen_row - boxsize)
     r1_src = min(H, cen_row + boxsize + 1)
     c0_src = max(0, cen_col - boxsize)
@@ -191,7 +212,6 @@ def run_pipeline(
     row_slice = slice(r0_src, r1_src)
     col_slice = slice(c0_src, c1_src)
 
-    # Padding needed if ROI extends outside the detector
     pad_top    = max(0, boxsize - cen_row)
     pad_bottom = max(0, (cen_row + boxsize + 1) - H)
     pad_left   = max(0, boxsize - cen_col)
@@ -211,15 +231,21 @@ def run_pipeline(
         for j in range(j0, j1)
     ]
     n_pos = len(positions)
-    print(f"Running pipeline on {n_pos} positions  ({i1-i0} × {j1-j0})...")
+    mode_label = "direct" if direct_mode else "virtual stack"
+    print(f"Running pipeline on {n_pos} positions  ({i1-i0} × {j1-j0})  [{mode_label}]...")
 
     def _process_one(ij: tuple[int, int]) -> dict:
         i, j       = ij
         idx        = scan.ij_to_index(i, j)
-        x_um, y_um = scan.ij_to_xy(i, j)   # returns (x, y) in mm
-        # Hyperslab read: transfer only the ROI region, not the full frame
-        with h5py.File(img_source, "r") as h5f:
-            roi = h5f[h5_img_key][idx, row_slice, col_slice].astype(np.float64)
+        x_um, y_um = scan.ij_to_xy(i, j)
+        if direct_mode:
+            with h5py.File(files[idx], "r") as h5f:
+                ds  = h5f[direct_h5_key]
+                roi = (ds[0, row_slice, col_slice] if squeeze
+                       else ds[row_slice, col_slice]).astype(np.float64)
+        else:
+            with h5py.File(img_source, "r") as h5f:
+                roi = h5f[h5_img_key][idx, row_slice, col_slice].astype(np.float64)
         if needs_pad:
             roi = np.pad(roi, ((pad_top, pad_bottom), (pad_left, pad_right)))
         metrics = analyze_spot(roi, **spot_kwargs)
@@ -227,7 +253,7 @@ def run_pipeline(
             "i":         i,
             "j":         j,
             "frame_idx": idx,
-            "x_um":      float(x_um) * 1e3,   # mm → µm
+            "x_um":      float(x_um) * 1e3,
             "y_um":      float(y_um) * 1e3,
             **metrics,
         }
