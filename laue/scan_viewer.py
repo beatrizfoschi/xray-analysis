@@ -114,7 +114,7 @@ def scan_viewer(
     )
 
     fig, (ax_map, ax_img) = plt.subplots(
-        2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 5]}
+        2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 2]}
     )
 
     # As setas esquerda/direita são mapeadas por padrão pelo matplotlib como
