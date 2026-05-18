@@ -11,8 +11,6 @@ Usage
 ...     h5_path="scan_001.h5",
 ...     xeol_roi=(350.0, 450.0),            # nm
 ...     img_source="path/to/tifs",          # TIF folder
-...     roi_y=slice(1360, 1420),
-...     roi_x=slice(1230, 1280),
 ... )
 
 >>> scan_viewer(
@@ -20,8 +18,6 @@ Usage
 ...     xeol_roi=(350.0, 450.0),            # nm
 ...     img_source="scan_001.h5",           # H5 with images
 ...     h5_img_key="2.1/instrument/detector/data",
-...     roi_y=slice(1360, 1420),
-...     roi_x=slice(1230, 1280),
 ... )
 """
 
@@ -46,8 +42,6 @@ def scan_viewer(
     h5_path: str | Path,
     xeol_roi: tuple[float, float],
     img_source: str | Path,
-    roi_y: slice | None = None,
-    roi_x: slice | None = None,
     *,
     scan_number: int = 1,
     img_prefix: str = "img_",
@@ -69,9 +63,6 @@ def scan_viewer(
         Wavelength integration range in nm, e.g. ``(350.0, 450.0)``.
     img_source:
         TIF folder path, or HDF5 file path containing detector images.
-    roi_y, roi_x:
-        Detector ROI slices in [y, x] (row, column) convention.
-        Pass ``None`` (default) to use the full image.
     scan_number:
         Scan entry number inside the HDF5 (default 1).
     img_prefix, img_suffix, img_index_pad:
@@ -110,8 +101,7 @@ def scan_viewer(
         else:
             fname = img_source / f"{img_prefix}{file_index:0>{img_index_pad}d}{img_suffix}"
             raw = read_image(fname)
-        crop = raw[roi_y, roi_x] if (roi_y is not None or roi_x is not None) else raw
-        return sk.exposure.adjust_sigmoid(crop, cutoff=sigmoid_cutoff, gain=sigmoid_gain)
+        return sk.exposure.adjust_sigmoid(raw, cutoff=sigmoid_cutoff, gain=sigmoid_gain)
 
     def _calc_lims(im: np.ndarray, m: float = 3.0) -> tuple[float, float]:
         return im.mean() - m * im.std(), im.mean() + m * im.std()
@@ -124,7 +114,7 @@ def scan_viewer(
     )
 
     fig, (ax_map, ax_img) = plt.subplots(
-        2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 5]}
+        2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 4]}
     )
 
     # As setas esquerda/direita são mapeadas por padrão pelo matplotlib como
@@ -162,7 +152,7 @@ def scan_viewer(
         ax_map.set_xlabel("Position [μm]")
         ax_map.set_ylabel("Position [μm]")
         ax_map.set_title(map_label)
-        ax_map.pcolormesh(motor_x, motor_y, fluo_grid, cmap="inferno")
+        ax_map.pcolormesh(motor_x, motor_y, fluo_grid, cmap="viridis")
         ax_map.hlines(motor_y[row], motor_x.min(), motor_x.max(), color="blue")
         ax_map.vlines(motor_x[col], motor_y.min(), motor_y.max(), color="blue")
 
@@ -175,13 +165,9 @@ def scan_viewer(
         ax_img.set_ylabel("Y pixel")
         ax_img.set_title(f"File index: {file_index}")
         ny, nx = img.shape
-        x0 = roi_x.start if roi_x is not None else 0
-        x1 = roi_x.stop  if roi_x is not None else nx
-        y0 = roi_y.start if roi_y is not None else 0
-        y1 = roi_y.stop  if roi_y is not None else ny
         ax_img.imshow(
             img, vmin=imin, vmax=imax, cmap="seismic",
-            extent=[x0, x1, y1, y0],
+            extent=[0, nx, ny, 0],
         )
 
         if _state["zoom_map"] is not None:
