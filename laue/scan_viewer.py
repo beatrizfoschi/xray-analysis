@@ -127,27 +127,25 @@ def scan_viewer(
         2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 5]}
     )
 
-    # Zoom state: None = matplotlib auto-limits; populated by user pan/zoom
-    _zoom: dict[str, tuple | None] = {"map": None, "img": None}
-    _updating = [False]  # suppresses saves during programmatic redraws
+    # Zoom state: compara limites atuais com os defaults da primeira draw.
+    # Não usa callbacks — lê os limites antes de cla() a cada update.
+    _state: dict = {
+        "default_map": None,   # limites auto da primeira draw (fixos)
+        "default_img": None,
+        "zoom_map":    None,   # limites definidos pelo usuário (None = full view)
+        "zoom_img":    None,
+    }
 
-    def _save_map_lim(_=None) -> None:
-        if not _updating[0]:
-            _zoom["map"] = (ax_map.get_xlim(), ax_map.get_ylim())
-
-    def _save_img_lim(_=None) -> None:
-        if not _updating[0]:
-            _zoom["img"] = (ax_img.get_xlim(), ax_img.get_ylim())
-
-    def _connect_zoom_callbacks() -> None:
-        # cla() removes all callbacks — reconnect after every redraw
-        ax_map.callbacks.connect("xlim_changed", _save_map_lim)
-        ax_map.callbacks.connect("ylim_changed", _save_map_lim)
-        ax_img.callbacks.connect("xlim_changed", _save_img_lim)
-        ax_img.callbacks.connect("ylim_changed", _save_img_lim)
+    def _lims_differ(a: tuple, b: tuple) -> bool:
+        return not (np.allclose(a[0], b[0]) and np.allclose(a[1], b[1]))
 
     def _update(row: int, col: int) -> None:
-        _updating[0] = True
+        # Lê limites antes de cla() para detectar zoom do usuário
+        if _state["default_map"] is not None:
+            cur_map = (ax_map.get_xlim(), ax_map.get_ylim())
+            cur_img = (ax_img.get_xlim(), ax_img.get_ylim())
+            _state["zoom_map"] = cur_map if _lims_differ(cur_map, _state["default_map"]) else None
+            _state["zoom_img"] = cur_img if _lims_differ(cur_img, _state["default_img"]) else None
 
         ax_map.cla()
         ax_img.cla()
@@ -178,16 +176,20 @@ def scan_viewer(
             extent=[x0, x1, y1, y0],
         )
 
-        if _zoom["map"] is not None:
-            ax_map.set_xlim(_zoom["map"][0])
-            ax_map.set_ylim(_zoom["map"][1])
-        if _zoom["img"] is not None:
-            ax_img.set_xlim(_zoom["img"][0])
-            ax_img.set_ylim(_zoom["img"][1])
+        if _state["zoom_map"] is not None:
+            ax_map.set_xlim(_state["zoom_map"][0])
+            ax_map.set_ylim(_state["zoom_map"][1])
+        if _state["zoom_img"] is not None:
+            ax_img.set_xlim(_state["zoom_img"][0])
+            ax_img.set_ylim(_state["zoom_img"][1])
 
-        _connect_zoom_callbacks()
-        fig.canvas.draw()   # síncrono: ajustes de set_aspect disparam enquanto _updating=True
-        _updating[0] = False
+        if _state["default_map"] is None:
+            # Primeira draw: síncrona para capturar os limites auto do matplotlib
+            fig.canvas.draw()
+            _state["default_map"] = (ax_map.get_xlim(), ax_map.get_ylim())
+            _state["default_img"] = (ax_img.get_xlim(), ax_img.get_ylim())
+        else:
+            fig.canvas.draw_idle()
 
     def _on_key(event) -> None:
         row, col = row_slider.value, col_slider.value
