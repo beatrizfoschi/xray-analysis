@@ -107,14 +107,14 @@ def scan_viewer(
         return im.mean() - m * im.std(), im.mean() + m * im.std()
 
     row_slider = widgets.IntSlider(
-        value=0, min=0, max=scan.nbypoints - 1, step=1, description="Row"
+        value=scan.nbypoints // 2, min=0, max=scan.nbypoints - 1, step=1, description="Row"
     )
     col_slider = widgets.IntSlider(
-        value=0, min=0, max=scan.nbxpoints - 1, step=1, description="Col"
+        value=scan.nbxpoints // 2, min=0, max=scan.nbxpoints - 1, step=1, description="Col"
     )
 
     fig, (ax_map, ax_img) = plt.subplots(
-        2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 4]}
+        2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 5]}
     )
 
     # As setas esquerda/direita são mapeadas por padrão pelo matplotlib como
@@ -165,9 +165,13 @@ def scan_viewer(
         ax_img.set_ylabel("Y pixel")
         ax_img.set_title(f"File index: {file_index}")
         ny, nx = img.shape
+        x0 = roi_x.start if roi_x is not None else 0
+        x1 = roi_x.stop  if roi_x is not None else nx
+        y0 = roi_y.start if roi_y is not None else 0
+        y1 = roi_y.stop  if roi_y is not None else ny
         ax_img.imshow(
             img, vmin=imin, vmax=imax, cmap="seismic",
-            extent=[0, nx, ny, 0],
+            extent=[x0, x1, y1, y0],
         )
 
         if _state["zoom_map"] is not None:
