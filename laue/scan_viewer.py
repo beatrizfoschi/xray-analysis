@@ -127,8 +127,13 @@ def scan_viewer(
         2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 5]}
     )
 
-    # Zoom state: compara limites atuais com os defaults da primeira draw.
-    # Não usa callbacks — lê os limites antes de cla() a cada update.
+    # As setas esquerda/direita são mapeadas por padrão pelo matplotlib como
+    # "back/forward view history" — isso conflita com a navegação do scan.
+    plt.rcParams["keymap.back"]    = [k for k in plt.rcParams["keymap.back"]    if k != "left"]
+    plt.rcParams["keymap.forward"] = [k for k in plt.rcParams["keymap.forward"] if k != "right"]
+
+    # Zoom state: salvo apenas no button_release (pan/zoom com mouse).
+    # Separado completamente da navegação por slider/teclado.
     _state: dict = {
         "default_map": None,   # limites auto da primeira draw (fixos)
         "default_img": None,
@@ -139,14 +144,17 @@ def scan_viewer(
     def _lims_differ(a: tuple, b: tuple) -> bool:
         return not (np.allclose(a[0], b[0]) and np.allclose(a[1], b[1]))
 
-    def _update(row: int, col: int) -> None:
-        # Lê limites antes de cla() para detectar zoom do usuário
-        if _state["default_map"] is not None:
-            cur_map = (ax_map.get_xlim(), ax_map.get_ylim())
-            cur_img = (ax_img.get_xlim(), ax_img.get_ylim())
-            _state["zoom_map"] = cur_map if _lims_differ(cur_map, _state["default_map"]) else None
-            _state["zoom_img"] = cur_img if _lims_differ(cur_img, _state["default_img"]) else None
+    def _on_mouse_release(_) -> None:
+        if _state["default_map"] is None:
+            return
+        cur_map = (ax_map.get_xlim(), ax_map.get_ylim())
+        cur_img = (ax_img.get_xlim(), ax_img.get_ylim())
+        _state["zoom_map"] = cur_map if _lims_differ(cur_map, _state["default_map"]) else None
+        _state["zoom_img"] = cur_img if _lims_differ(cur_img, _state["default_img"]) else None
 
+    fig.canvas.mpl_connect("button_release_event", _on_mouse_release)
+
+    def _update(row: int, col: int) -> None:
         ax_map.cla()
         ax_img.cla()
 
