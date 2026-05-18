@@ -127,14 +127,17 @@ def scan_viewer(
         2, 1, figsize=(8, 10), gridspec_kw={"height_ratios": [1, 5]}
     )
 
-    # Zoom state: None = use matplotlib auto-limits; set by user pan/zoom
+    # Zoom state: None = matplotlib auto-limits; populated by user pan/zoom
     _zoom: dict[str, tuple | None] = {"map": None, "img": None}
+    _updating = [False]  # suppresses saves during programmatic redraws
 
     def _save_map_lim(_=None) -> None:
-        _zoom["map"] = (ax_map.get_xlim(), ax_map.get_ylim())
+        if not _updating[0]:
+            _zoom["map"] = (ax_map.get_xlim(), ax_map.get_ylim())
 
     def _save_img_lim(_=None) -> None:
-        _zoom["img"] = (ax_img.get_xlim(), ax_img.get_ylim())
+        if not _updating[0]:
+            _zoom["img"] = (ax_img.get_xlim(), ax_img.get_ylim())
 
     def _connect_zoom_callbacks() -> None:
         # cla() removes all callbacks — reconnect after every redraw
@@ -144,6 +147,8 @@ def scan_viewer(
         ax_img.callbacks.connect("ylim_changed", _save_img_lim)
 
     def _update(row: int, col: int) -> None:
+        _updating[0] = True
+
         ax_map.cla()
         ax_img.cla()
 
@@ -173,8 +178,6 @@ def scan_viewer(
             extent=[x0, x1, y1, y0],
         )
 
-        # Restore zoom after redraw (before connecting callbacks to avoid
-        # our own set_xlim/set_ylim triggering _save_*_lim)
         if _zoom["map"] is not None:
             ax_map.set_xlim(_zoom["map"][0])
             ax_map.set_ylim(_zoom["map"][1])
@@ -183,7 +186,8 @@ def scan_viewer(
             ax_img.set_ylim(_zoom["img"][1])
 
         _connect_zoom_callbacks()
-        fig.canvas.draw_idle()
+        fig.canvas.draw()   # síncrono: ajustes de set_aspect disparam enquanto _updating=True
+        _updating[0] = False
 
     def _on_key(event) -> None:
         row, col = row_slider.value, col_slider.value
