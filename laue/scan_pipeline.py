@@ -190,7 +190,10 @@ def run_pipeline(
 
     # Resolve file list and detector shape
     if direct_mode:
-        files = sorted(img_source.glob("*.h5"))
+        files = sorted(
+            img_source.glob("*.h5"),
+            key=lambda p: int(p.stem.split("_")[-1])
+        )
         if not files:
             raise FileNotFoundError(f"No .h5 files found in {img_source}")
         with h5py.File(files[0], "r") as h5f:
@@ -347,8 +350,8 @@ def plot_maps(
         lo   = np.nanpercentile(data, percentile_clip[0])
         hi   = np.nanpercentile(data, percentile_clip[1])
 
-        extent = [x_um.min(), x_um.max(), y_um.max(), y_um.min()]
-        im = ax.imshow(data, origin="upper", aspect="equal",
+        extent = [x_um.min(), x_um.max(), y_um.min(), y_um.max()]
+        im = ax.imshow(data, origin="lower", aspect="equal",
                        extent=extent, cmap=cmap, vmin=lo, vmax=hi)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         ax.set_title(title, fontsize=10)

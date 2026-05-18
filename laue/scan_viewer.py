@@ -2,14 +2,14 @@
 scan_viewer.py
 ==============
 
-Interactive viewer: fluorescence map + diffraction image for a Laue raster scan.
+Interactive viewer: XEOL emission map + diffraction image for a Laue raster scan.
 
 Usage
 -----
 >>> from laue.scan_viewer import scan_viewer
 >>> scan_viewer(
 ...     h5_path="scan_001.h5",
-...     fluo_element="Ga",
+...     xeol_roi=(350.0, 450.0),            # nm
 ...     img_source="path/to/tifs",          # TIF folder
 ...     roi_y=slice(1360, 1420),
 ...     roi_x=slice(1230, 1280),
@@ -17,7 +17,7 @@ Usage
 
 >>> scan_viewer(
 ...     h5_path="scan_001.h5",
-...     fluo_element="Ga",
+...     xeol_roi=(350.0, 450.0),            # nm
 ...     img_source="scan_001.h5",           # H5 with images
 ...     h5_img_key="2.1/instrument/detector/data",
 ...     roi_y=slice(1360, 1420),
@@ -36,7 +36,7 @@ import numpy as np
 import skimage as sk
 from IPython.display import display
 
-from lauexplore.emission import Fluorescence
+from lauexplore.emission import XEOL
 from lauexplore.image import read as read_image
 from lauexplore.plots.base import _as_grid
 from lauexplore.scan import Scan
@@ -44,7 +44,7 @@ from lauexplore.scan import Scan
 
 def scan_viewer(
     h5_path: str | Path,
-    fluo_element: str,
+    xeol_roi: tuple[float, float],
     img_source: str | Path,
     roi_y: slice | None = None,
     roi_x: slice | None = None,
@@ -55,17 +55,18 @@ def scan_viewer(
     img_index_pad: int = 4,
     h5_img_key: str | None = None,
     normalize_to_monitor: bool = True,
+    xeol_norm_zone: tuple[float, float] | None = None,
     sigmoid_cutoff: float = 0.5,
     sigmoid_gain: float = 5.0,
 ) -> tuple[plt.Figure, widgets.Widget]:
-    """Interactive fluorescence map + diffraction image viewer.
+    """Interactive XEOL emission map + diffraction image viewer.
 
     Parameters
     ----------
     h5_path:
         Path to the scan HDF5 file.
-    fluo_element:
-        Element symbol as stored in the HDF5 (e.g. ``"Ga"``).
+    xeol_roi:
+        Wavelength integration range in nm, e.g. ``(350.0, 450.0)``.
     img_source:
         TIF folder path, or HDF5 file path containing detector images.
     roi_y, roi_x:
@@ -79,7 +80,10 @@ def scan_viewer(
         Dataset key inside ``img_source`` when it is an HDF5 file.
         Indexed as ``h5f[h5_img_key][file_index]``.
     normalize_to_monitor:
-        Divide fluorescence by monitor counts (default True).
+        Divide XEOL by monitor counts (default True).
+    xeol_norm_zone:
+        Wavelength range (nm) used as normalization reference, passed to
+        ``XEOL.from_h5`` as ``norm_zone``.
     sigmoid_cutoff, sigmoid_gain:
         Parameters for ``skimage.exposure.adjust_sigmoid``.
     """
@@ -87,10 +91,13 @@ def scan_viewer(
     img_source = Path(img_source)
 
     scan = Scan.from_h5(h5_path, scan_number)
-    fluo = Fluorescence.from_h5(h5_path, fluo_element, scan_number,
-                                normalize_to_monitor=normalize_to_monitor)
+    xeol = XEOL.from_h5(h5_path, scan_number,
+                         roi=xeol_roi,
+                         normalize_to_monitor=normalize_to_monitor,
+                         norm_zone=xeol_norm_zone)
 
-    fluo_grid = _as_grid(fluo.data, scan)
+    fluo_grid = _as_grid(xeol.data, scan)
+    map_label = f"XEOL {xeol_roi[0]:.0f}–{xeol_roi[1]:.0f} nm"
     motor_x   = scan.xpoints * 1e3          # mm → µm, shape (nbxpoints,)
     motor_y   = scan.ypoints * 1e3          # mm → µm, shape (nbypoints,)
 
@@ -127,7 +134,7 @@ def scan_viewer(
         ax_map.set_aspect("equal")
         ax_map.set_xlabel("Position [μm]")
         ax_map.set_ylabel("Position [μm]")
-        ax_map.set_title(f"{fluo_element} fluorescence")
+        ax_map.set_title(map_label)
         ax_map.pcolormesh(motor_x, motor_y, fluo_grid, cmap="inferno")
         ax_map.hlines(motor_y[row], motor_x.min(), motor_x.max(), color="blue")
         ax_map.vlines(motor_x[col], motor_y.min(), motor_y.max(), color="blue")
