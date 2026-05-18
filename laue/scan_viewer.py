@@ -165,13 +165,9 @@ def scan_viewer(
         ax_img.set_ylabel("Y pixel")
         ax_img.set_title(f"File index: {file_index}")
         ny, nx = img.shape
-        x0 = roi_x.start if roi_x is not None else 0
-        x1 = roi_x.stop  if roi_x is not None else nx
-        y0 = roi_y.start if roi_y is not None else 0
-        y1 = roi_y.stop  if roi_y is not None else ny
         ax_img.imshow(
             img, vmin=imin, vmax=imax, cmap="seismic",
-            extent=[x0, x1, y1, y0],
+            extent=[0, nx, ny, 0],
         )
 
         if _state["zoom_map"] is not None:
