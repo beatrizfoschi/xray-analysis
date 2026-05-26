@@ -274,13 +274,74 @@ def run_pipeline(
     return df
 
 
+# ── Scan-level: streak angle gradient ────────────────────────────────────────
+
+def compute_theta_gradient(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a ``theta_gradient`` column: local rate of change of streak angle.
+
+    Computes the magnitude of the spatial gradient of θ across the scan grid
+    using central differences.  A smooth gradient marks screw-TD asterism
+    zones; a sharp jump marks a GNB wall crossing.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Output of ``run_pipeline`` (must contain i, j, theta columns).
+
+    Returns
+    -------
+    DataFrame with an additional ``theta_gradient`` column (°/step).
+    """
+    df = df.copy()
+    i_vals = np.sort(df["i"].unique())
+    j_vals = np.sort(df["j"].unique())
+    i_min, j_min = int(i_vals.min()), int(j_vals.min())
+
+    grid = np.full((len(i_vals), len(j_vals)), np.nan)
+    idx_map: dict[tuple, tuple] = {}
+    for _, row in df.iterrows():
+        gi = int(row["i"] - i_min)
+        gj = int(row["j"] - j_min)
+        grid[gi, gj] = row["theta"]
+        idx_map[(int(row["i"]), int(row["j"]))] = (gi, gj)
+
+    # Central-difference gradient (angle wrap-safe via complex trick)
+    angle_rad = np.deg2rad(grid)
+    cos_g, sin_g = np.cos(angle_rad), np.sin(angle_rad)
+    dcos_di = np.gradient(cos_g, axis=0);  dsin_di = np.gradient(sin_g, axis=0)
+    dcos_dj = np.gradient(cos_g, axis=1);  dsin_dj = np.gradient(sin_g, axis=1)
+    # |dθ/di|² + |dθ/dj|²  in radians → degrees
+    grad_mag = np.degrees(np.sqrt(
+        (dcos_di ** 2 + dsin_di ** 2) + (dcos_dj ** 2 + dsin_dj ** 2)
+    ))
+
+    df["theta_gradient"] = df.apply(
+        lambda r: float(grad_mag[idx_map[(int(r["i"]), int(r["j"]))]]),
+        axis=1,
+    )
+    return df
+
+
 # ── 2D map visualisation ──────────────────────────────────────────────────────
 
 _DEFAULT_METRICS = [
-    ("aspect_ratio",   "Aspect ratio  λ₁/λ₂",        "plasma"),
-    ("theta",          "Streak angle θ (°)",           "hsv"),
-    ("streak_D95",     "Streak length D95 (px)",       "inferno"),
-    ("core_tail_ratio","Core-to-tail ratio R",         "viridis"),
+    # Layer 1 — essential core
+    ("streak_D95",       "Streak length D95 (px)",      "inferno"),
+    ("theta",            "Streak angle θ (°)",          "hsv"),
+    ("aspect_ratio",     "Aspect ratio λ₁/λ₂",         "plasma"),
+    ("x_com_rel",        "COM displacement x (px)",     "RdBu"),
+    ("y_com_rel",        "COM displacement y (px)",     "RdBu"),
+    # Layer 2 — physical interpretation
+    ("core_tail_ratio",  "Core-to-tail ratio R",        "viridis"),
+    ("kurtosis_streak",  "Kurtosis (streak axis)",      "coolwarm"),
+    ("skewness_streak",  "Skewness (streak axis)",      "coolwarm"),
+    ("d95_d50_ratio",    "D95/D50 ratio",               "plasma"),
+    # Layer 3 — refinement
+    ("effective_radius", "Effective radius √(λ₁+λ₂)",  "inferno"),
+    ("tail_decay_xi",    "Tail decay length ξ (px)",    "magma"),
+    ("gaussian_residual","Gaussian residual (norm.)",   "hot"),
+    ("peak_com_offset",  "Peak–COM offset (px)",        "plasma"),
+    ("n_local_maxima",   "N local maxima",              "Reds"),
 ]
 
 
