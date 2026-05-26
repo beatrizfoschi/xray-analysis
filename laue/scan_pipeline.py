@@ -350,6 +350,7 @@ def plot_maps(
     scan,
     metrics:            list[tuple[str, str, str]] | None = None,
     *,
+    ncols:              int = 4,
     percentile_clip:    tuple[float, float] = (2, 98),
     figsize:            tuple[float, float] | None = None,
 ) -> plt.Figure:
@@ -362,7 +363,9 @@ def plot_maps(
     scan : lauexplore.scan.Scan
         Scan object for physical axis labels.
     metrics : list of (column, title, cmap) or None
-        Which metrics to plot.  Defaults to aspect_ratio, theta, D95, R.
+        Which metrics to plot.  Defaults to all _DEFAULT_METRICS.
+    ncols : int
+        Maximum number of panels per row (default 4).
     percentile_clip : (lo, hi)
         Colour scale percentiles.
     figsize : (w, h) or None
@@ -375,11 +378,10 @@ def plot_maps(
     if metrics is None:
         metrics = _DEFAULT_METRICS
 
-    n       = len(metrics)
-    nbx     = df["i"].nunique()
-    nby     = df["j"].nunique()
+    n     = len(metrics)
+    ncols = min(ncols, n)
+    nrows = int(np.ceil(n / ncols))
 
-    # Physical extent in µm
     x_um = np.sort(df["x_um"].unique())
     y_um = np.sort(df["y_um"].unique())
     dx   = (x_um[-1] - x_um[0]) if len(x_um) > 1 else 1.0
@@ -389,35 +391,36 @@ def plot_maps(
     panel_h = 4.0
     panel_w = max(3.0, panel_h * aspect)
     if figsize is None:
-        figsize = (min(n * panel_w + n * 0.5, 20), panel_h + 1.5)
+        figsize = (ncols * panel_w + ncols * 0.5, nrows * (panel_h + 1.5))
 
-    fig, axes = plt.subplots(1, n, figsize=figsize)
-    if n == 1:
-        axes = [axes]
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
 
-    # Build 2D grid for each metric using (i, j) indices
     i_min, j_min = df["i"].min(), df["j"].min()
+    nbx, nby     = df["i"].nunique(), df["j"].nunique()
     grid_shape   = (nbx, nby)
+    extent       = [x_um.min(), x_um.max(), y_um.min(), y_um.max()]
 
-    for ax, (col, title, cmap) in zip(axes, metrics):
+    for idx, (col, title, cmap) in enumerate(metrics):
+        ax = axes[idx // ncols, idx % ncols]
+
         grid = np.full(grid_shape, np.nan)
         for _, row in df.iterrows():
-            gi = int(row["i"] - i_min)
-            gj = int(row["j"] - j_min)
-            grid[gi, gj] = row[col]
+            grid[int(row["i"] - i_min), int(row["j"] - j_min)] = row[col]
 
-        # Transpose so that x → horizontal, y → vertical
-        data = grid.T          # shape (nby, nbx)
+        data = grid.T
         lo   = np.nanpercentile(data, percentile_clip[0])
         hi   = np.nanpercentile(data, percentile_clip[1])
 
-        extent = [x_um.min(), x_um.max(), y_um.min(), y_um.max()]
         im = ax.imshow(data, origin="lower", aspect="equal",
                        extent=extent, cmap=cmap, vmin=lo, vmax=hi)
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("x (µm)")
         ax.set_ylabel("y (µm)")
+
+    # Hide unused axes in the last row
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols, idx % ncols].set_visible(False)
 
     plt.tight_layout()
     return fig
