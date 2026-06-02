@@ -359,12 +359,30 @@ def refine_peak_parabola_nonuniform(wl, y, idx):
     return float(wl_peak), True
 
 
+def _nbins_for(nbins_spec, v, x_range, idx):
+    """Resolve nbins for a single panel.
+
+    nbins_spec can be:
+      int         — same for all panels
+      str         — numpy rule applied per panel: "auto", "fd", "sturges", "sqrt"
+      list/tuple  — one value per panel (int or str), indexed by idx
+    """
+    spec = nbins_spec[idx] if isinstance(nbins_spec, (list, tuple)) else nbins_spec
+    if isinstance(spec, str):
+        clipped = v[(v >= x_range[0]) & (v <= x_range[1])]
+        if clipped.size < 2:
+            return 30
+        edges = np.histogram_bin_edges(clipped, bins=spec)
+        return max(len(edges) - 1, 5)
+    return int(spec)
+
+
 def plot_strain_histograms_plotly_1d(
     strain_1d: dict,
     *,
     components=None,
     component_titles=None,
-    nbins=60,
+    nbins="fd",
     histnorm="probability",
     x_range=None,
     robust_percentile=99.5,
@@ -387,8 +405,12 @@ def plot_strain_histograms_plotly_1d(
         Subset of keys to plot. Defaults to all keys in strain_1d.
     component_titles : dict, optional
         Maps component keys to HTML-formatted axis titles.
-    nbins : int
-        Number of histogram bins.
+    nbins : int, str, or list/tuple
+        Number of histogram bins. Options:
+        - ``int``         — same count for every panel.
+        - ``str``         — numpy rule applied per panel: ``"auto"``, ``"fd"``
+                            (Freedman-Diaconis, default), ``"sturges"``, ``"sqrt"``.
+        - ``list``/``tuple`` — one value (int or str) per component.
     histnorm : str or None
         Plotly histnorm: "probability", "probability density", or None (counts).
     x_range : tuple(float, float), optional
@@ -447,7 +469,7 @@ def plot_strain_histograms_plotly_1d(
         fig.add_trace(
             go.Histogram(
                 x=v,
-                nbinsx=nbins,
+                nbinsx=_nbins_for(nbins, v, x_range, i),
                 histnorm=histnorm,
                 marker=dict(color=bar_fill, line=dict(color=bar_line, width=1)),
                 hovertemplate="ε = %{x:.2e}<br>%{y:.3f}<extra></extra>",
