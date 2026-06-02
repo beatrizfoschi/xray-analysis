@@ -491,7 +491,7 @@ def plot_strain_histograms_plotly_1d(
                 x=0.02, y=0.98,
                 xref=f"{xa} domain",
                 yref=f"{ya} domain",
-                text=f"μ={mu:.0e}<br>σ={sig:.1e}<br>N={v.size}",
+                text=f"μ={mu:.1f}<br>σ={sig:.1f}<br>N={v.size}",
                 showarrow=False,
                 align="left",
                 font=dict(size=11, color="rgba(30,30,30,0.85)"),
