@@ -3,6 +3,8 @@ from scipy import ndimage as ndi
 import skimage.filters as filters
 from skimage.morphology import remove_small_objects, binary_opening, disk, binary_closing
 from skimage.measure import label, regionprops
+from skimage.segmentation import watershed
+from skimage.filters import sobel
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.stats import skew, kurtosis, mode
@@ -16,7 +18,8 @@ def segment_leds(
     threshold_percentile=30,
     otsu=False,
     min_area=300,
-    opening_radius=2
+    opening_radius=2,
+    fill_gaps=False,
 ):
     """
     Segment LEDs from a 2D emission map.
@@ -33,6 +36,10 @@ def segment_leds(
         block_size for threshold_local).
     opening_radius : int
         Radius for morphological opening disk.
+    fill_gaps : bool
+        If True, use watershed to grow each label back to the full LED extent
+        (binary before opening), using the intensity gradient as boundary guide.
+        Useful when LED projections touch each other.
 
     Returns
     -------
@@ -47,12 +54,18 @@ def segment_leds(
     thr = filters.threshold_local(thr, block_size=min_area)
     if otsu:
         thr = filters.threshold_otsu(img)
-    binary = img >= thr
 
-    binary = binary_opening(binary, disk(opening_radius))
+    binary_full = img >= thr  # extensão completa dos LEDs, antes do opening
+
+    binary = binary_opening(binary_full, disk(opening_radius))
     binary = remove_small_objects(binary, min_size=min_area)
 
     labels = label(binary)
+
+    if fill_gaps:
+        binary_full = remove_small_objects(binary_full, min_size=min_area // 4)
+        labels = watershed(sobel(img), markers=labels, mask=binary_full)
+
     regions = regionprops(labels, intensity_image=img)
 
     return labels, regions
