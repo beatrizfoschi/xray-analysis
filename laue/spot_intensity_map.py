@@ -45,7 +45,7 @@ Usage
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import h5py
@@ -64,17 +64,58 @@ def _make_slices(center: tuple[int, int], boxsize: tuple[int, int]):
     return slice(cy - hh, cy + hh), slice(cx - hw, cx + hw)
 
 
+def _h5_single_file_worker(args):
+    """Top-level worker required for ProcessPoolExecutor pickling."""
+    file_path, h5_key, squeeze, row_start, row_stop, col_start, col_stop = args
+    rs = slice(row_start, row_stop)
+    cs = slice(col_start, col_stop)
+    with h5py.File(file_path, "r") as f:
+        roi = f[h5_key][0, rs, cs] if squeeze else f[h5_key][rs, cs]
+    return float(roi.sum())
+
+
 def _integrate_h5_roi(img_source: Path, h5_img_key: str, n: int,
                       row_slice: slice, col_slice: slice, workers: int) -> np.ndarray:
+    with h5py.File(img_source, "r") as f:
+        is_virtual = f[h5_img_key].is_virtual
+        if is_virtual:
+            src_folder = Path(f.attrs["source_folder"])
+            src_key    = str(f.attrs["source_key"])
+
+    if not is_virtual:
+        # Real dataset: single-threaded batch read is optimal
+        result = np.empty(n, dtype=float)
+        batch = 500
+        with h5py.File(img_source, "r") as f:
+            ds = f[h5_img_key]
+            with tqdm(total=n, desc="Loading H5 frames", unit="img") as pbar:
+                for start in range(0, n, batch):
+                    end = min(start + batch, n)
+                    result[start:end] = ds[start:end, row_slice, col_slice].sum(axis=(1, 2))
+                    pbar.update(end - start)
+        return result
+
+    # Virtual dataset (1 file per frame): bypass virtual links and read source
+    # files directly so ProcessPoolExecutor achieves true parallel I/O.
+    source_files = sorted(src_folder.glob("*.h5"))[:n]
+    with h5py.File(source_files[0], "r") as f:
+        squeeze = f[src_key].ndim == 3  # (1, H, W) stored per file
+
+    args_list = [
+        (str(fp), src_key, squeeze,
+         row_slice.start, row_slice.stop,
+         col_slice.start, col_slice.stop)
+        for fp in source_files
+    ]
+
     result = np.empty(n, dtype=float)
-    batch = 500
-    with h5py.File(img_source, "r") as h5f:
-        ds = h5f[h5_img_key]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_h5_single_file_worker, a): i
+                   for i, a in enumerate(args_list)}
         with tqdm(total=n, desc="Loading H5 frames", unit="img") as pbar:
-            for start in range(0, n, batch):
-                end = min(start + batch, n)
-                result[start:end] = ds[start:end, row_slice, col_slice].sum(axis=(1, 2))
-                pbar.update(end - start)
+            for future in as_completed(futures):
+                result[futures[future]] = future.result()
+                pbar.update(1)
     return result
 
 
