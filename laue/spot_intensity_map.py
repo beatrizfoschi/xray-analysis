@@ -66,19 +66,9 @@ def _make_slices(center: tuple[int, int], boxsize: tuple[int, int]):
 
 def _integrate_h5_roi(img_source: Path, h5_img_key: str, n: int,
                       row_slice: slice, col_slice: slice, workers: int) -> np.ndarray:
-    def _worker(i):
-        with h5py.File(img_source, "r") as h5f:
-            return i, float(h5f[h5_img_key][i, row_slice, col_slice].sum())
-
-    result = np.empty(n)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_worker, i): i for i in range(n)}
-        with tqdm(total=n, desc="Loading H5 frames", unit="img") as pbar:
-            for future in as_completed(futures):
-                idx, val = future.result()
-                result[idx] = val
-                pbar.update(1)
-    return result
+    with h5py.File(img_source, "r") as h5f:
+        data = h5f[h5_img_key][:n, row_slice, col_slice]
+    return data.sum(axis=(1, 2), dtype=float)
 
 
 def _integrate_tifs(img_source: Path, img_prefix: str, img_suffix: str,
