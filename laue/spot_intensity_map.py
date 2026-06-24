@@ -66,9 +66,16 @@ def _make_slices(center: tuple[int, int], boxsize: tuple[int, int]):
 
 def _integrate_h5_roi(img_source: Path, h5_img_key: str, n: int,
                       row_slice: slice, col_slice: slice, workers: int) -> np.ndarray:
+    result = np.empty(n, dtype=float)
+    batch = 500
     with h5py.File(img_source, "r") as h5f:
-        data = h5f[h5_img_key][:n, row_slice, col_slice]
-    return data.sum(axis=(1, 2), dtype=float)
+        ds = h5f[h5_img_key]
+        with tqdm(total=n, desc="Loading H5 frames", unit="img") as pbar:
+            for start in range(0, n, batch):
+                end = min(start + batch, n)
+                result[start:end] = ds[start:end, row_slice, col_slice].sum(axis=(1, 2))
+                pbar.update(end - start)
+    return result
 
 
 def _integrate_tifs(img_source: Path, img_prefix: str, img_suffix: str,
