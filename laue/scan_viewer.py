@@ -152,7 +152,7 @@ def scan_viewer(
         ax_map.set_xlabel("Position [μm]")
         ax_map.set_ylabel("Position [μm]")
         ax_map.set_title(map_label)
-        ax_map.pcolormesh(motor_x, motor_y, fluo_grid, cmap="viridis")
+        ax_map.pcolormesh(motor_x, motor_y, fluo_grid, cmap="rainbow")
         ax_map.hlines(motor_y[row], motor_x.min(), motor_x.max(), color="blue")
         ax_map.vlines(motor_x[col], motor_y.min(), motor_y.max(), color="blue")
 
