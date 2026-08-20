@@ -339,7 +339,7 @@ def roi_mosaic_from_track(
 
 
 def plot_roi_mosaic(mosaic, title=None, cmap="viridis", vmin=None, vmax=None, invert_y=False, extent=None):
-    """Display the ROI mosaic image built by roi_mosaic_from_track."""
+    """Display the ROI mosaic image built by roi_mosaic_from_track or build_mosaic_h5."""
     plt.figure(figsize=(12, 6))
     plt.imshow(mosaic, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest", extent=extent)
     if title:
@@ -348,4 +348,76 @@ def plot_roi_mosaic(mosaic, title=None, cmap="viridis", vmin=None, vmax=None, in
     if invert_y:
         plt.gca().invert_yaxis()
     plt.show()
+
+
+def build_mosaic_h5(
+    h5_path,
+    dset_path,
+    scan,
+    roi_center,
+    boxsize,
+    scan_subset=None,
+    fill_value=np.nan,
+    dtype=np.float32,
+):
+    """
+    Stitch a fixed detector ROI, read from every position of a 2D scan, into one mosaic image.
+
+    Unlike lauexplore's Mosaic/build_mosaic (which needs one file per frame, read via
+    fabio), this reads directly from a single stacked HDF5 dataset (shape
+    n_frames x H x W), the same layout used throughout xray-analysis/satellite_peak_analysis.
+
+    The ROI center (x, y) is the same for every frame — use track_spot_h5 +
+    roi_mosaic_from_track instead if the spot moves across the scan.
+
+    Parameters
+    ----------
+    h5_path     : path to the HDF5 file.
+    dset_path   : HDF5 dataset key (e.g. 'entry_0000/CRGIF/eiger4m/data').
+    scan        : lauexplore Scan object — provides nbxpoints, nbypoints, ij_to_index(i, j).
+    roi_center  : (x, y) = (col, row) centre of the ROI on the detector (pixels).
+    boxsize     : half-size of the tile: tile shape = (2*boxsize+1, 2*boxsize+1).
+    scan_subset : (i0, i1, j0, j1) — restrict to a sub-region of the scan grid.
+                  Processes the full scan when None.
+    fill_value  : value used for tile pixels that fall outside the detector image.
+    dtype       : output mosaic array dtype.
+
+    Returns
+    -------
+    mosaic : np.ndarray, shape ((j1-j0)*tile, (i1-i0)*tile).
+             Grid row 0 = j0, grid col 0 = i0, tiles placed in scan order — matches
+             plt.imshow(mosaic) with the default origin='upper'.
+    """
+    col_c, row_c = int(roi_center[0]), int(roi_center[1])
+    tile = 2 * boxsize + 1
+    row0, row1 = row_c - boxsize, row_c + boxsize + 1
+    col0, col1 = col_c - boxsize, col_c + boxsize + 1
+
+    nx, ny = scan.nbxpoints, scan.nbypoints
+    i0, i1, j0, j1 = scan_subset if scan_subset is not None else (0, nx, 0, ny)
+
+    mosaic = np.full(((j1 - j0) * tile, (i1 - i0) * tile), fill_value, dtype=dtype)
+
+    with h5py.File(h5_path, "r") as hin:
+        dset = hin[dset_path]
+        n_frames, H, W = dset.shape
+
+        # ROI is fixed for every frame, so the boundary clip only needs to be
+        # computed once (unlike _tile_from_center, built for a per-frame center).
+        row0c, row1c = max(0, row0), min(H, row1)
+        col0c, col1c = max(0, col0), min(W, col1)
+        tr0, tc0 = row0c - row0, col0c - col0
+
+        for j in tqdm(range(j0, j1), desc="Building mosaic", leave=True):
+            for i in range(i0, i1):
+                frame_idx = scan.ij_to_index(i, j)
+                if frame_idx >= n_frames:
+                    continue
+                patch = dset[frame_idx, row0c:row1c, col0c:col1c]
+
+                r, c = j - j0, i - i0
+                rr, cc = r * tile + tr0, c * tile + tc0
+                mosaic[rr:rr + patch.shape[0], cc:cc + patch.shape[1]] = patch
+
+    return mosaic
 

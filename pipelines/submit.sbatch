@@ -11,29 +11,30 @@
 
 
 
-source ~/miniconda/etc/profile.d/conda.sh
-conda activate lauexplore-env
+## (Opcional) ativar seu ambiente
+##source ~/miniconda/etc/profile.d/conda.sh
+##conda activate lauexplore-env
 
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
-##  --h5path /data/visitor/blc16817/bm32/20260120/RAW_DATA/MLed/MLed_map/MLed_map.h5 \
+##  --h5path /data/visitor/<proposal>/bm32/<session>/RAW_DATA/MLed/MLed_map/MLed_map.h5 \
 ##  --scan-number 1 \
 ## seed 1960596962
 
 python -u nmf_sbatch_job.py \
   --spectra-npy data_nmf.npy \
-  --wl-npy wl_array.npy \
-  --map-nx 81 --map-ny 121 \
-  --n-components 5 \
+  --wl-npy wl_nmf.npy \
+  --map-nx 101 --map-ny 201 \
+  --n-components 4 \
   --loss kullback-leibler \
   --init random \
   --max-iter 5000 \
   --extent 0 40 40 0 \
-  --random-state 0 \
-  --outdir ./k_5/nmf_out_k_5_random \
+  --random-state 1700138881 \
+  --outdir nmf_out_k_10_random_tol-5 \
   --tol 1e-5 \
 
 

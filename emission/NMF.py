@@ -2,6 +2,72 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import NMF
 
+
+def run_nmf(
+    X,                 # (n_pixels, n_channels)
+    n_components=4,
+    loss="frobenius",  # "frobenius" or "kullback-leibler"
+    solver=None,       # None -> pick default based on loss
+    init="nndsvda",
+    max_iter=1000,
+    random_state=0,
+    tol=1e-4,
+    l1_ratio=0.0,
+    alpha_W=0.0,
+    alpha_H=0.0,
+    clip_negative=True,
+):
+    """
+    Fit scikit-learn NMF on a flat (n_pixels, n_channels) matrix.
+
+    Shared core behind `nmf_sklearn_hyperspectral` (here and in
+    `pipelines/nmf_sbatch_job.py`) and `nmf_per_seg._run_nmf`. Those three
+    differed only in their defaults and in how they reshape the result; the fit
+    itself was identical, so they now all route through this function. Their
+    individual defaults are preserved at each call site — do not unify them here.
+
+    Returns
+    -------
+    W     : (n_pixels, K)
+    H     : (K, n_channels)
+    X_rec : (n_pixels, n_channels)  reconstruction W @ H
+    rmse  : (n_pixels,)             per-pixel reconstruction RMSE
+    model : fitted sklearn NMF object
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"X must be 2D (n_pixels, n_channels). Got {X.shape}.")
+
+    # NMF requires non-negative data
+    if X.min() < 0:
+        if not clip_negative:
+            raise ValueError("NMF requires non-negative X. Clip negatives or change preprocessing.")
+        X = X.copy()
+        X[X < 0] = 0.0
+
+    if solver is None:
+        solver = "mu" if loss == "kullback-leibler" else "cd"
+
+    model = NMF(
+        n_components=n_components,
+        init=init,
+        solver=solver,
+        beta_loss=loss,
+        max_iter=max_iter,
+        random_state=random_state,
+        tol=tol,
+        alpha_W=alpha_W,
+        alpha_H=alpha_H,
+        l1_ratio=l1_ratio,
+    )
+
+    W = model.fit_transform(X)      # (n_pixels, K)
+    H = model.components_           # (K, n_channels)
+    X_rec = W @ H
+    rmse = np.sqrt(np.mean((X - X_rec) ** 2, axis=1))
+    return W, H, X_rec, rmse, model
+
+
 def nmf_sklearn_hyperspectral(
     X,                 # (n_pixels, n_channels)
     map_shape,         # (nx, ny) with nx*ny == n_pixels
@@ -18,6 +84,7 @@ def nmf_sklearn_hyperspectral(
     alpha_H=0.0,
     clip_negative=True,
     show_progress=True,
+    tol=1e-4,
 ):
     """
     Fits NMF with scikit-learn on hyperspectral data X and returns:
@@ -49,44 +116,19 @@ def nmf_sklearn_hyperspectral(
         if nx * ny != n_pixels:
             raise ValueError(f"map_shape product must match n_pixels. Got {nx*ny} vs {n_pixels}.")
 
-        # NMF requires non-negative data
-        if clip_negative and X.min() < 0:
-            X = X.copy()
-            X[X < 0] = 0.0
-        elif X.min() < 0:
-            raise ValueError("NMF requires non-negative X. Clip negatives or change preprocessing.")
-
         if wavelength is None:
             wavelength = np.arange(n_ch)
 
-        # Choose solver default
-        if solver is None:
-            solver = "mu" if loss == "kullback-leibler" else "cd"
-
-        model = NMF(
-            n_components=n_components,
-            init=init,
-            solver=solver,
-            beta_loss=loss,
-            max_iter=max_iter,
-            random_state=random_state,
-            alpha_W=alpha_W,
-            alpha_H=alpha_H,
-            l1_ratio=l1_ratio,
+        step("fit_transform (this is the long part)")
+        W, H, X_rec, rmse, model = run_nmf(
+            X, n_components,
+            loss=loss, solver=solver, init=init, max_iter=max_iter,
+            random_state=random_state, tol=tol, l1_ratio=l1_ratio,
+            alpha_W=alpha_W, alpha_H=alpha_H, clip_negative=clip_negative,
         )
 
-        # Fit
-        step("fit_transform (this is the long part)")
-        W = model.fit_transform(X)      # (n_pixels, K)
-        H = model.components_           # (K, n_channels)
-
-        # Reconstruction
         step("reconstruct")
-        X_rec = W @ H
-
-        # Residuals / reshape
         step("rmse + reshape")
-        rmse = np.sqrt(np.mean((X - X_rec) ** 2, axis=1))
         E_map = rmse.reshape(nx, ny)
         W_maps = W.reshape(nx, ny, n_components)
 

@@ -101,6 +101,10 @@ def scan_viewer(
         else:
             fname = img_source / f"{img_prefix}{file_index:0>{img_index_pad}d}{img_suffix}"
             raw = read_image(fname)
+        # adjust_sigmoid normaliza pelo teto do dtype (65535 p/ uint16), não pelo
+        # range real dos dados — sem isso, cutoff/gain não têm efeito visível.
+        raw = raw.astype(np.float64)
+        raw = sk.exposure.rescale_intensity(raw, out_range=(0.0, 1.0))
         return sk.exposure.adjust_sigmoid(raw, cutoff=sigmoid_cutoff, gain=sigmoid_gain)
 
     def _calc_lims(im: np.ndarray, m: float = 3.0) -> tuple[float, float]:

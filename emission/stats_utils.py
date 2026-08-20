@@ -1,61 +1,70 @@
+from __future__ import annotations
+
 import numpy as np
 from scipy import ndimage as ndi
 import skimage.filters as filters
 from skimage.morphology import remove_small_objects, binary_opening, disk, binary_closing
 from skimage.measure import label, regionprops
+import matplotlib.patches as mpatches
 from skimage.segmentation import watershed
 from skimage.filters import sobel
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.stats import skew, kurtosis, mode
 import scipy.stats
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+
+from utils.fitting import fwhm_from_sigma, gaussian
+from utils.regions import elliptical_masks_um
 
 
 def segment_leds(
-    image,
-    threshold_percentile=30,
-    otsu=False,
-    min_area=300,
-    opening_radius=2,
-    fill_gaps=False,
+    image: np.ndarray,
+    min_area: int = 300,
+    opening_radius: int = 2,
+    fill_gaps: bool = False,
+    plot: bool = False,
+    extent: tuple[float, float, float, float] | None = None,
+    figsize: tuple[float, float] | None = None,
 ):
-    """
-    Segment LEDs from a 2D emission map.
+    """Segment LED regions from a 2-D map (emission map or metric map).
 
     Parameters
     ----------
-    image : 2D array
-        Emission map (LEDs only).
-    threshold_percentile : float
-        Percentile of non-zero pixels used to compute the threshold value,
-        then passed as block_size to threshold_local.
-    min_area : int
-        Minimum region size in pixels (used for remove_small_objects and as
-        block_size for threshold_local).
-    opening_radius : int
-        Radius for morphological opening disk.
-    fill_gaps : bool
-        If True, use watershed to grow each label back to the full LED extent
-        (binary before opening), using the intensity gradient as boundary guide.
-        Useful when LED projections touch each other.
+    image               : 2-D array — emission map or metric map (e.g. from
+                          make_metric_grid). NaN values are treated as background
+                          (set to 0).
+    min_area            : minimum region size in pixels. Also used as the
+                          block_size of threshold_local, so it must be odd.
+    opening_radius      : disk radius for morphological opening (separates
+                          touching LEDs and removes thin bridges).
+    fill_gaps           : if True, use watershed to grow each label back to
+                          the full extent before opening (useful when LED
+                          projections touch each other).
+    plot                : if True, show side-by-side plots of the map and
+                          the resulting segmentation.
+    extent              : [xmin, xmax, ymin, ymax] for axis labels in µm.
+                          If None, pixel indices are used.
+    figsize             : figure size. Auto-sized when None.
 
     Returns
     -------
-    labels : 2D int array
-        Labeled image (0 = background, 1..N LEDs).
-    regions : list
-        regionprops objects for each labeled LED.
+    labels  : 2-D int array — 0 = background, 1..N = LED regions.
+    regions : list of skimage regionprops objects.
     """
-    img = np.asarray(image, dtype=float)
+    import matplotlib.colors as mcolors
 
-    thr = np.percentile(img[img > 0], threshold_percentile)
-    thr = filters.threshold_local(thr, block_size=min_area)
-    if otsu:
-        thr = filters.threshold_otsu(img)
+    img = np.where(np.isfinite(image), image, 0.0).astype(float)
 
-    binary_full = img >= thr  # extensão completa dos LEDs, antes do opening
+    nonzero = img[img > 0]
+    if len(nonzero) == 0:
+        raise ValueError("image has no positive finite values — check the map.")
+
+    # Former global-percentile threshold, replaced by the local adaptive one below.
+    # To restore it, re-add `threshold_percentile: float = 30.0` to the signature:
+    #     thr = float(np.percentile(nonzero, threshold_percentile))
+    thr = filters.threshold_local(img, block_size=min_area)
+
+    binary_full = img >= thr
 
     binary = binary_opening(binary_full, disk(opening_radius))
     binary = remove_small_objects(binary, min_size=min_area)
@@ -67,6 +76,65 @@ def segment_leds(
         labels = watershed(sobel(img), markers=labels, mask=binary_full)
 
     regions = regionprops(labels, intensity_image=img)
+
+    if plot:
+        n_leds    = int(labels.max())
+        imshow_kw = dict(origin='lower', interpolation='none',
+                         extent=extent if extent is not None else None)
+        xlabel    = 'x (µm)' if extent is not None else 'col (px)'
+        ylabel    = 'y (µm)' if extent is not None else 'row (px)'
+
+        cmap_led  = plt.cm.get_cmap('tab20', max(n_leds, 1))
+        colors    = [(0.85, 0.85, 0.85, 1.0)] + [cmap_led(k) for k in range(n_leds)]
+        cmap_disc = mcolors.ListedColormap(colors)
+        led_ids   = list(range(1, n_leds + 1))
+        bounds    = [-0.5] + [v - 0.5 for v in led_ids] + [led_ids[-1] + 0.5]
+        norm      = mcolors.BoundaryNorm(bounds, cmap_disc.N)
+
+        if figsize is None:
+            figsize = (12, 5)
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+        # Map
+        ax = axes[0]
+        finite_vals = image[np.isfinite(image)]
+        vmin = float(np.nanpercentile(finite_vals, 2))  if len(finite_vals) else 0
+        vmax = float(np.nanpercentile(finite_vals, 98)) if len(finite_vals) else 1
+        im = ax.imshow(image, cmap='viridis', vmin=vmin, vmax=vmax, **imshow_kw)
+        plt.colorbar(im, ax=ax, label='Value')
+        ax.set_title('Map')
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+
+        # Segmentation
+        ax = axes[1]
+        im = ax.imshow(labels, cmap=cmap_disc, norm=norm, **imshow_kw)
+        cbar = plt.colorbar(im, ax=ax, ticks=led_ids)
+        cbar.set_label('LED ID')
+        ax.set_title(f'Segmentation — {n_leds} regions')
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+
+        # LED ID labels at centroid
+        pe = __import__('matplotlib.patheffects', fromlist=['withStroke'])
+        stroke = pe.withStroke(linewidth=2, foreground='black')
+        for reg in regions:
+            r_c, c_c = reg.centroid   # (row, col) in pixel coords
+            if extent is not None:
+                nby, nbx = labels.shape
+                xmin, xmax, ymin, ymax = extent
+                xc = xmin + (c_c / nbx) * (xmax - xmin)
+                yc = ymin + (r_c / nby) * (ymax - ymin)
+            else:
+                xc, yc = c_c, r_c
+            ax.text(xc, yc, str(reg.label),
+                    ha='center', va='center', fontsize=8,
+                    fontweight='bold', color='white',
+                    path_effects=[stroke])
+
+        plt.tight_layout()
+        plt.show()
+        return labels, regions, fig
 
     return labels, regions
 
@@ -241,9 +309,6 @@ def plot_histograms_per_led(
         plt.show()
 
 
-def gauss_linbaseline(x, A, x0, sigma, m, b):
-    """Gaussian peak with linear baseline: A * exp(-(x-x0)^2 / 2σ^2) + m*x + b."""
-    return A * np.exp(-0.5 * ((x - x0) / sigma) ** 2) + (m * x + b)
 
 
 def fit_peak_get_fwhm(wl, y, wl_roi=(440, 520), half_window_nm=6.0, min_snr=5.0):
@@ -324,15 +389,16 @@ def fit_peak_get_fwhm(wl, y, wl_roi=(440, 520), half_window_nm=6.0, min_snr=5.0)
 
     step = float(np.median(np.diff(xw)))
     sigma0 = max(step, half_window_nm / 6.0)
-    p0 = [A0, wl0_guess, sigma0, 0.0, b0]
+    # order follows utils.fitting.gaussian: amplitude, centre, sigma, background, slope
+    p0 = [A0, wl0_guess, sigma0, b0, 0.0]
 
     lower = [0.0, xw.min(), step / 20, -np.inf, -np.inf]
     upper = [np.inf, xw.max(), half_window_nm, np.inf, np.inf]
 
     try:
-        popt, _ = curve_fit(gauss_linbaseline, xw, yw, p0=p0, bounds=(lower, upper), maxfev=4000)
-        A, wl0, sigma, m, b = popt
-        fwhm = 2.0 * np.sqrt(2.0 * np.log(2.0)) * abs(sigma)
+        popt, _ = curve_fit(gaussian, xw, yw, p0=p0, bounds=(lower, upper), maxfev=4000)
+        A, wl0, sigma, b, m = popt
+        fwhm = fwhm_from_sigma(sigma)
 
         if not np.isfinite(wl0) or not np.isfinite(fwhm) or fwhm <= 0:
             return np.nan, np.nan, False
@@ -372,176 +438,145 @@ def refine_peak_parabola_nonuniform(wl, y, idx):
     return float(wl_peak), True
 
 
-def _nbins_for(nbins_spec, v, x_range, idx):
-    """Resolve nbins for a single panel.
-
-    nbins_spec can be:
-      int         — same for all panels
-      str         — numpy rule applied per panel: "auto", "fd", "sturges", "sqrt"
-      list/tuple  — one value per panel (int or str), indexed by idx
-    """
-    spec = nbins_spec[idx] if isinstance(nbins_spec, (list, tuple)) else nbins_spec
-    if isinstance(spec, str):
-        clipped = v[(v >= x_range[0]) & (v <= x_range[1])]
-        if clipped.size < 2:
-            return 30
-        edges = np.histogram_bin_edges(clipped, bins=spec)
-        return max(len(edges) - 1, 5)
-    return int(spec)
 
 
-def plot_strain_histograms_plotly_1d(
-    strain_1d: dict,
+
+
+def extract_spectra_from_circles(
+    xeol,
+    centers_um: dict,
+    radius_um: float,
+    x_points: np.ndarray,
+    y_points: np.ndarray,
+    img_shape: tuple,
     *,
-    components=None,
-    component_titles=None,
-    nbins="fd",
-    histnorm="probability",
-    x_range=None,
-    robust_percentile=99.5,
-    show_stats=True,
-    rows=2,
-    cols=2,
-    height=650,
-    width=900,
-    title="Deviatoric strain distribution (µLaue)"
-):
-    """
-    Plot interactive histograms of deviatoric strain components using Plotly.
+    labels=None,
+    cmap: str = "tab20",
+    figsize: tuple = (5, 5),
+    vline_nm: float | list[float] | None = None,
+    sharey: bool = False,
+) -> tuple[dict, plt.Figure]:
+    """Extract mean spectra from circular regions around user-defined centres.
 
     Parameters
     ----------
-    strain_1d : dict
-        Maps component name to 1D array of strain values.
-        Example keys: "e_xx_yy_over2", "e_zz", "e_xy", "e_xz_yz_over2".
-    components : list, optional
-        Subset of keys to plot. Defaults to all keys in strain_1d.
-    component_titles : dict, optional
-        Maps component keys to HTML-formatted axis titles.
-    nbins : int, str, or list/tuple
-        Number of histogram bins. Options:
-        - ``int``         — same count for every panel.
-        - ``str``         — numpy rule applied per panel: ``"auto"``, ``"fd"``
-                            (Freedman-Diaconis, default), ``"sturges"``, ``"sqrt"``.
-        - ``list``/``tuple`` — one value (int or str) per component.
-    histnorm : str or None
-        Plotly histnorm: "probability", "probability density", or None (counts).
-    x_range : tuple(float, float), optional
-        Common x-axis range for all panels. Auto-computed from robust_percentile if None.
-    robust_percentile : float
-        Percentile used to auto-compute x_range (default: 99.5).
-    show_stats : bool
-        Annotate each panel with mean, std, and N; draw a mean line.
+    xeol : XEOL
+        XEOL object with `spectra` (Npoints, Nchannels) and `wl_array`.
+    centers_um : dict
+        ``{led_id: (x_um, y_um)}`` — centre of each circle in physical units (µm).
+    radius_um : float
+        Circle radius in µm.
+    x_points, y_points : 1D arrays
+        Physical axis arrays used to build the scan grid.
+    img_shape : (nrows, ncols)
+        Shape of the 2D map array (same as used in ``xeol.data.reshape(...)``).
+    labels : 2D int array, optional
+        Segmentation map drawn as background (for visual reference).
+    cmap : str
+        Colormap for the segmentation overlay (default "tab20").
+    figsize : (w, h)
+        Figure size in inches.
+    vline_nm : float or list of float, optional
+        Wavelength(s) in nm where a vertical dashed line is drawn on the
+        individual and overlaid spectrum plots (e.g. ``460.0`` or ``[423.0, 460.0]``).
 
     Returns
     -------
-    fig : plotly.graph_objects.Figure
+    mean_spectra : dict
+        ``{led_id: spectrum array}`` — mean spectrum within each circle.
+    fig : plt.Figure
+        Map with circles overlaid at the specified centres.
+
+    Example
+    -------
+    >>> centers = {
+    ...     1: (3.0,  3.0),
+    ...     2: (13.0, 3.0),
+    ...     3: (23.0, 3.0),
+    ... }
+    >>> spectra, fig = extract_spectra_from_circles(
+    ...     xeol, centers, radius_um=2.0,
+    ...     x_points=x_points, y_points=y_points,
+    ...     img_shape=(101, 201), labels=labels,
+    ... )
     """
-    if components is None:
-        components = list(strain_1d.keys())
+    masks = elliptical_masks_um(centers_um, radius_um, x_points, y_points, img_shape)
 
-    if component_titles is None:
-        component_titles = {
-            "e_xx_yy_over2": r"ε<sub>(xx+yy)/2</sub>",
-            "e_zz": r"ε<sub>zz</sub>",
-            "e_xy": r"ε<sub>xy</sub>",
-            "e_xz_yz_over2": r"ε<sub>(xz+yz)/2</sub>",
-        }
+    # ── extract spectra ───────────────────────────────────────────────────────
+    mean_spectra = {}
 
-    data = {}
-    for c in components:
-        v = np.asarray(strain_1d[c]).ravel()
-        v = v[np.isfinite(v)]
-        if v.size == 0:
-            raise ValueError(f"No finite values found for component '{c}'.")
-        data[c] = v
+    for led_id, mask in masks.items():
+        specs = xeol.spectra[mask.flatten(), :]
+        mean_spectra[led_id] = specs.mean(axis=0) if specs.shape[0] > 0 \
+                               else np.full(xeol.wl_array.shape, np.nan)
 
-    if x_range is None:
-        allv = np.concatenate([data[c] for c in components], axis=0)
-        lim = np.nanpercentile(np.abs(allv), robust_percentile)
-        if not np.isfinite(lim) or lim == 0:
-            lim = np.nanmax(np.abs(allv))
-        x_range = (-lim, lim)
+    # ── plot ──────────────────────────────────────────────────────────────────
+    img_data = xeol.data.reshape(img_shape)
+    extent   = [x_points[0], x_points[-1], y_points[-1], y_points[0]]
 
-    fig = make_subplots(
-        rows=rows,
-        cols=cols,
-        subplot_titles=[component_titles.get(c, c) for c in components],
-        horizontal_spacing=0.12,
-        vertical_spacing=0.18
-    )
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(img_data, cmap='viridis', alpha=1, extent=extent, vmin=0)
+    if labels is not None:
+        ax.imshow(labels, cmap=cmap, alpha=0.45, extent=extent)
 
-    bar_fill = "rgba(120,120,120,0.55)"
-    bar_line = "rgba(50,50,50,0.9)"
-
-    for i, c in enumerate(components):
-        r = i // cols + 1
-        co = i % cols + 1
-        v = data[c]
-
-        fig.add_trace(
-            go.Histogram(
-                x=v,
-                nbinsx=_nbins_for(nbins, v, x_range, i),
-                histnorm=histnorm,
-                marker=dict(color=bar_fill, line=dict(color=bar_line, width=1)),
-                hovertemplate="ε = %{x:.2e}<br>%{y:.3f}<extra></extra>",
-                showlegend=False,
-            ),
-            row=r, col=co
+    for led_id, (x_c_um, y_c_um) in centers_um.items():
+        ellipse = mpatches.Ellipse(
+            (x_c_um, y_c_um), width=2 * radius_um, height=2 * radius_um,
+            fill=False, edgecolor='white', linewidth=1.5, linestyle='--'
         )
+        ax.add_patch(ellipse)
+        ax.text(x_c_um, y_c_um, str(led_id),
+                ha='center', va='center', fontsize=8,
+                color='white', fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.1', facecolor='black', alpha=0.4))
 
-        fig.add_vline(x=0, line_width=2, line_color="rgba(255,0,0,1)", row=r, col=co)
-        fig.update_xaxes(range=list(x_range), row=r, col=co)
+    ax.invert_yaxis()
+    ax.set_aspect(1)
+    ax.set_xlabel('x (µm)')
+    ax.set_ylabel('y (µm)')
+    ax.set_title(f'Circle extraction  r={radius_um} µm')
+    plt.tight_layout()
 
-        xa = "x" if i == 0 else f"x{i+1}"
-        ya = "y" if i == 0 else f"y{i+1}"
+    # ── espectros sobrepostos ──────────────────────────────────────────────────
+    wl         = xeol.wl_array
+    led_ids    = sorted(mean_spectra)
+    tab_colors = plt.get_cmap('tab20').colors
+    vlines     = ([vline_nm] if isinstance(vline_nm, (int, float))
+                  else (vline_nm or []))
 
-        if show_stats:
-            mu = np.nanmean(v)
-            sig = np.nanstd(v)
-            fig.add_annotation(
-                x=0.02, y=0.98,
-                xref=f"{xa} domain",
-                yref=f"{ya} domain",
-                text=f"μ={mu:.2f}<br>σ={sig:.2f}<br>N={v.size}",
-                showarrow=False,
-                align="left",
-                font=dict(size=11, color="rgba(30,30,30,0.85)"),
-                bgcolor="rgba(255,255,255,0.75)",
-                bordercolor="rgba(0,0,0,0.15)",
-                borderwidth=1,
-                borderpad=4
-            )
-            fig.add_vline(x=mu, line_width=2, line_color="rgba(0,0,255,1)", line_dash="dot", row=r, col=co)
+    def _draw_vlines(ax):
+        for v in vlines:
+            ax.axvline(v, color='k', linewidth=0.8, linestyle='--', alpha=0.6)
 
-    fig.add_trace(
-        go.Scatter(
-            x=[None], y=[None],
-            mode="lines",
-            line=dict(color="rgba(0,0,255,1)", dash="dot"),
-            name="μ",
-        )
-    )
+    fig_ov, ax_ov = plt.subplots(figsize=(10, 5))
+    for led_id in led_ids:
+        ax_ov.plot(wl, mean_spectra[led_id],
+                   color=tab_colors[(led_id - 1) % 20],
+                   label=f'LED {led_id}', lw=1.2)
+    _draw_vlines(ax_ov)
+    ax_ov.set_xlabel('Wavelength (nm)')
+    ax_ov.set_ylabel('Intensity (a.u.)')
+    ax_ov.set_title(f'Mean spectrum per LED — r={radius_um} µm')
+    ax_ov.legend(fontsize=8, ncol=2)
+    fig_ov.tight_layout()
 
-    fig.update_layout(
-        title=dict(text=title, x=0.5, xanchor="center"),
-        bargap=0.05,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        height=height,
-        width=width,
-        margin=dict(l=70, r=30, t=80, b=60),
-        font=dict(family="Arial", size=14, color="rgba(20,20,20,1)")
-    )
-    fig.update_xaxes(
-        showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False,
-        ticks="outside", ticklen=5, tickcolor="rgba(0,0,0,0.35)", title_text="strain"
-    )
-    fig.update_yaxes(
-        showgrid=True, gridcolor="rgba(0,0,0,0.08)", zeroline=False,
-        ticks="outside", ticklen=5, tickcolor="rgba(0,0,0,0.35)",
-        title_text="probability" if histnorm else "counts"
-    )
+    # ── subplots individuais ───────────────────────────────────────────────────
+    n         = len(led_ids)
+    ncols_plt = 4
+    nrows_plt = (n + ncols_plt - 1) // ncols_plt
+    fig_ind, axes = plt.subplots(nrows_plt, ncols_plt,
+                                 figsize=(ncols_plt * 3.5, nrows_plt * 2.5),
+                                 sharex=True, sharey=sharey)
+    for ax2, led_id in zip(axes.flat, led_ids):
+        ax2.plot(wl, mean_spectra[led_id],
+                 color=tab_colors[(led_id - 1) % 20], lw=1.0)
+        _draw_vlines(ax2)
+        ax2.set_title(f'LED {led_id}', fontsize=9)
+        ax2.set_xlabel('λ (nm)', fontsize=7)
+        ax2.tick_params(labelsize=7)
+    for ax2 in axes.flat[n:]:
+        ax2.axis('off')
+    fig_ind.suptitle(f'Mean spectrum per LED — r={radius_um} µm', fontsize=11)
+    fig_ind.tight_layout()
 
-    return fig
+    return mean_spectra, fig, fig_ov, fig_ind

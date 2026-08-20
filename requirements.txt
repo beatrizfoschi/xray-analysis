@@ -1,0 +1,26 @@
+numpy
+scipy
+matplotlib
+pandas
+scikit-learn
+scikit-image
+h5py
+fabio
+tqdm
+threadpoolctl
+pillow
+plotly            # laue/mean_strain: histogramas interativos
+
+# Notebook helpers (roi_viewer, scan_viewer, satellite visualize)
+ipython
+ipywidgets
+
+# Tests
+pytest
+
+# Laue indexing and geometry
+LaueTools
+
+# Not on PyPI — clone and add to sys.path:
+#   https://github.com/serbng/lauexplore
+# lauexplore

@@ -35,6 +35,10 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Claude memory
+.claude/
+CLAUDE_MEMORY.md
+
 # IDEs
 .vscode/
 .idea/

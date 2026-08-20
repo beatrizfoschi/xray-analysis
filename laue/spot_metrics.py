@@ -25,6 +25,9 @@ from __future__ import annotations
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
+# Gaussian FWHM = 2*sqrt(2*ln2) * sigma; sigma = sqrt(lambda) from the inertia tensor.
+_FWHM_FACTOR = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
 
@@ -376,15 +379,19 @@ def n_local_maxima(
     *,
     min_distance: int = 3,
     threshold_rel: float = 0.1,
+    min_separation: float | None = None,
 ) -> int:
     """Count distinct local intensity maxima above a relative threshold.
 
     Parameters
     ----------
     min_distance : int
-        Minimum pixel separation between maxima (half-width of filter).
+        Minimum pixel separation between maxima (half-width of L∞ filter).
     threshold_rel : float
         Maxima below ``threshold_rel * img.max()`` are ignored.
+    min_separation : float or None
+        If given, apply greedy Euclidean NMS: discard any maximum that is
+        closer than ``min_separation`` pixels to a stronger one.
 
     Returns
     -------
@@ -395,9 +402,25 @@ def n_local_maxima(
 
     if img.sum() == 0:
         return 0
-    size      = 2 * min_distance + 1
-    local_max = img == maximum_filter(img, size=size)
-    return int((local_max & (img >= threshold_rel * img.max())).sum())
+    size = 2 * min_distance + 1
+    mask = (img == maximum_filter(img, size=size)) & (img >= threshold_rel * img.max())
+    rows, cols = np.where(mask)
+    if len(rows) == 0:
+        return 0
+    if min_separation is None or min_separation <= 0:
+        return int(len(rows))
+    # Greedy Euclidean NMS: process strongest candidates first
+    intensities = img[rows, cols]
+    order = np.argsort(intensities)[::-1]
+    kept_r: list[int] = []
+    kept_c: list[int] = []
+    for idx in order:
+        r, c = int(rows[idx]), int(cols[idx])
+        if all(np.hypot(r - kr, c - kc) >= min_separation
+               for kr, kc in zip(kept_r, kept_c)):
+            kept_r.append(r)
+            kept_c.append(c)
+    return len(kept_r)
 
 
 # ── Full pipeline for one spot ────────────────────────────────────────────────
@@ -414,12 +437,17 @@ def analyze_spot(
     min_counts: float = 10.0,
     lm_min_distance: int = 3,
     lm_threshold_rel: float = 0.1,
+    lm_min_separation: float | None = None,
 ) -> dict:
     """Run the full morphology pipeline on one ROI image.
 
     Layer 1 — essential core (always computed):
         x_com, y_com, x_com_rel, y_com_rel  — COM displacement field
         lambda1, lambda2                     — inertia eigenvalues
+        fwhm1, fwhm2                          — equivalent Gaussian FWHM per axis (px),
+                                                 2*sqrt(2*ln2)*sqrt(lambda); exact only if
+                                                 the spot profile is Gaussian-like along
+                                                 that axis (see gaussian_residual)
         aspect_ratio                         — λ₁/λ₂
         theta                                — streak angle (°)
         streak_D50, streak_D95               — core width and streak length (px)
@@ -441,7 +469,7 @@ def analyze_spot(
     """
     nan_result: dict = {k: np.nan for k in (
         "x_com", "y_com", "x_com_rel", "y_com_rel",
-        "lambda1", "lambda2", "aspect_ratio", "theta",
+        "lambda1", "lambda2", "fwhm1", "fwhm2", "aspect_ratio", "theta",
         "streak_D50", "streak_D95",
         "core_tail_ratio", "skewness_streak", "kurtosis_streak", "d95_d50_ratio",
         "effective_radius", "tail_decay_xi", "gaussian_residual",
@@ -468,6 +496,8 @@ def analyze_spot(
 
     # Layer 1
     lam1, lam2, ar, theta = inertia_tensor(proc, x_com, y_com)
+    fwhm1 = _FWHM_FACTOR * np.sqrt(lam1) if not np.isnan(lam1) else np.nan
+    fwhm2 = _FWHM_FACTOR * np.sqrt(lam2) if not np.isnan(lam2) else np.nan
     d50, d95              = streak_length(proc, x_com, y_com, theta)
 
     # Layer 2
@@ -482,7 +512,8 @@ def analyze_spot(
     pco   = peak_com_offset(proc, x_com, y_com)
     nlm   = n_local_maxima(proc,
                            min_distance=lm_min_distance,
-                           threshold_rel=lm_threshold_rel)
+                           threshold_rel=lm_threshold_rel,
+                           min_separation=lm_min_separation)
 
     return {
         "x_com":             x_com,
@@ -491,6 +522,8 @@ def analyze_spot(
         "y_com_rel":         y_com - cy,
         "lambda1":           lam1,
         "lambda2":           lam2,
+        "fwhm1":             fwhm1,
+        "fwhm2":             fwhm2,
         "aspect_ratio":      ar,
         "theta":             theta,
         "streak_D50":        d50,

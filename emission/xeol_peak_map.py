@@ -1,18 +1,23 @@
 """
-xeol_peak_map.py — Spatial map of XEOL emission peak position.
+xeol_peak_map.py — Spatial map of XEOL emission peak position and InGaN composition.
 
 For each scan point, fits a Gaussian to the emission peak within a
 user-defined wavelength window and maps the peak centre wavelength
-across the scan to evaluate emission homogeneity.
+across the scan.  An additional post-processing step converts the peak
+wavelength to InGaN In fraction (x) via Vegard's law + bowing, allowing
+spatial mapping of In concentration variation.
 
 Usage
 -----
->>> from laue.xeol_peak_map import fit_xeol_peak_map, plot_xeol_peak_map
+>>> from emission.xeol_peak_map import fit_xeol_peak_map, plot_xeol_peak_map
+>>> from emission.xeol_peak_map import add_In_fraction, plot_In_content_map
 >>> df = fit_xeol_peak_map(
 ...     h5_path="scan_001.h5",
 ...     wl_window=(360.0, 380.0),   # nm
 ... )
 >>> fig = plot_xeol_peak_map(df)
+>>> add_In_fraction(df)
+>>> fig_in = plot_In_content_map(df)
 """
 
 from __future__ import annotations
@@ -25,21 +30,11 @@ import pandas as pd
 from scipy.optimize import curve_fit
 from tqdm import tqdm
 
-from lauexplore.emission import XEOL
-from lauexplore.plots.base import _as_grid
+from utils.fitting import fwhm_from_sigma, gaussian, r_squared
 
-
-_FWHM_FACTOR = 2.0 * np.sqrt(2.0 * np.log(2.0))   # 2√(2 ln 2) ≈ 2.355
-
-
-def _gaussian(wl, amplitude, center, sigma, background):
-    return amplitude * np.exp(-0.5 * ((wl - center) / sigma) ** 2) + background
-
-
-def _r_squared(y, y_fit):
-    ss_res = np.sum((y - y_fit) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    return float(1.0 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+# lauexplore is imported inside fit_xeol_peak_map: it is the only function that
+# needs it, and it requires Python >= 3.9, so a module-level import would make the
+# Gaussian helpers and the In-fraction conversion unusable on older interpreters.
 
 
 def _fit_one(wl_win, spec_win):
@@ -54,18 +49,18 @@ def _fit_one(wl_win, spec_win):
 
     try:
         popt, _ = curve_fit(
-            _gaussian, wl_win, spec_win,
+            gaussian, wl_win, spec_win,
             p0=[amp0, cen0, sig0, bg0],
             bounds=(
                 [0,          wl_win[0],  1e-3,        -np.inf],
-                [np.inf,     wl_win[-1], wl_win.ptp(), np.inf],
+                [np.inf,     wl_win[-1], wl_win[-1] - wl_win[0], np.inf],
             ),
             maxfev=800,
         )
         amplitude, center, sigma, background = popt
-        y_fit   = _gaussian(wl_win, *popt)
-        r2      = _r_squared(spec_win, y_fit)
-        fwhm    = _FWHM_FACTOR * abs(sigma)
+        y_fit   = gaussian(wl_win, *popt)
+        r2      = r_squared(spec_win, y_fit)
+        fwhm    = fwhm_from_sigma(sigma)
         return center, amplitude, fwhm, background, r2, True
     except Exception:
         return np.nan, np.nan, np.nan, np.nan, np.nan, False
@@ -79,6 +74,7 @@ def fit_xeol_peak_map(
     normalize_to_monitor: bool = True,
     norm_zone: tuple[float, float] | None = None,
     min_amplitude: float = 0.0,
+    min_r_squared: float = 0.9,
 ) -> pd.DataFrame:
     """Fit a Gaussian peak to the XEOL spectrum in ``wl_window`` at each scan point.
 
@@ -97,6 +93,9 @@ def fit_xeol_peak_map(
     min_amplitude : float
         Points where the fitted amplitude is below this threshold are marked
         as not converged (useful to reject noise fits).
+    min_r_squared : float
+        Points where R² is below this threshold are marked as not converged
+        (default 0.9).
 
     Returns
     -------
@@ -109,6 +108,8 @@ def fit_xeol_peak_map(
         r_squared                — goodness of fit [0, 1]
         converged  (bool)        — True if the fit succeeded
     """
+    from lauexplore.emission import XEOL
+
     xeol = XEOL.from_h5(
         h5_path, scan_number,
         roi=wl_window,
@@ -117,7 +118,7 @@ def fit_xeol_peak_map(
     )
 
     wl      = xeol.wl_array
-    spectra = xeol.spectra
+    spectra = xeol.spectra  # already treated: ref subtraction + monitor + norm_zone
     scan    = xeol.scan
 
     # Mask to wavelength window
@@ -140,12 +141,13 @@ def fit_xeol_peak_map(
         pt_idx   = scan.ij_to_index(i, j)
         spec_win = spectra[pt_idx, mask].astype(float)
 
-        if normalize_to_monitor:
-            spec_win = spec_win * 1e5 / scan.monitor_data[pt_idx]
-
         center, amplitude, fwhm, background, r2, ok = _fit_one(wl_win, spec_win)
 
         if ok and amplitude < min_amplitude:
+            ok = False
+            center = amplitude = fwhm = background = r2 = np.nan
+
+        if ok and r2 < min_r_squared:
             ok = False
             center = amplitude = fwhm = background = r2 = np.nan
 
@@ -238,5 +240,135 @@ def plot_xeol_peak_map(
         ax.set_xlabel("x (µm)")
         ax.set_ylabel("y (µm)")
 
+    plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# InGaN composition from emission wavelength
+# ---------------------------------------------------------------------------
+
+def wl_to_In_fraction(
+    wl_nm: float | np.ndarray,
+    *,
+    eg_gan: float = 3.44,
+    eg_inn: float = 0.77,
+    bowing: float = 1.43,
+) -> float | np.ndarray:
+    """Convert emission peak wavelength to InGaN In fraction via Vegard's law + bowing.
+
+    Solves  E_g(x) = (1-x)*eg_gan + x*eg_inn - bowing*x*(1-x) = E_peak
+    for x ∈ [0, 1].  Returns NaN for wavelengths outside the physical range.
+
+    Parameters
+    ----------
+    wl_nm : float or array
+        Peak wavelength in nm.
+    eg_gan : float
+        GaN bandgap in eV (default 3.44 eV at RT).
+    eg_inn : float
+        InN bandgap in eV (default 0.77 eV).
+    bowing : float
+        Empirical bowing parameter in eV (default 1.43 eV).
+    """
+    wl_nm = np.asarray(wl_nm, dtype=float)
+    scalar = wl_nm.ndim == 0
+    wl_nm = np.atleast_1d(wl_nm)
+
+    E_peak = 1239.84 / wl_nm  # eV, E = hc/λ
+
+    # Rearranged quadratic: bowing·x² + (eg_inn - eg_gan - bowing)·x + (eg_gan - E_peak) = 0
+    a_coef = bowing
+    b_coef = eg_inn - eg_gan - bowing
+    c_coef = eg_gan - E_peak
+
+    discriminant = b_coef ** 2 - 4.0 * a_coef * c_coef
+    x = np.where(
+        discriminant >= 0,
+        (-b_coef - np.sqrt(np.maximum(discriminant, 0.0))) / (2.0 * a_coef),
+        np.nan,
+    )
+    x = np.where((x >= 0.0) & (x <= 1.0), x, np.nan)
+
+    return float(x[0]) if scalar else x
+
+
+def add_In_fraction(
+    df: pd.DataFrame,
+    *,
+    eg_gan: float = 3.44,
+    eg_inn: float = 0.77,
+    bowing: float = 1.43,
+) -> pd.DataFrame:
+    """Add an ``in_fraction`` column to a DataFrame returned by ``fit_xeol_peak_map``.
+
+    Non-converged points and wavelengths outside the physical InGaN range are NaN.
+    Modifies *df* in place and returns it.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Output of ``fit_xeol_peak_map``.
+    eg_gan, eg_inn, bowing : float
+        Vegard's law parameters passed to ``wl_to_In_fraction``.
+    """
+    x = wl_to_In_fraction(df["peak_wl"].values, eg_gan=eg_gan, eg_inn=eg_inn, bowing=bowing)
+    df["in_fraction"] = x
+    df.loc[~df["converged"], "in_fraction"] = np.nan
+    return df
+
+
+def plot_In_content_map(
+    df: pd.DataFrame,
+    *,
+    percentile_clip: tuple[float, float] = (2, 98),
+    cmap: str = "plasma",
+    figsize: tuple[float, float] = (6, 5),
+    title: str = "In fraction  x  (In$_x$Ga$_{1-x}$N)",
+) -> plt.Figure:
+    """Plot a spatial map of the In fraction derived from the XEOL peak wavelength.
+
+    Requires an ``in_fraction`` column — run ``add_In_fraction(df)`` first.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Output of ``fit_xeol_peak_map`` after calling ``add_In_fraction``.
+    percentile_clip : (lo, hi)
+        Colour scale percentiles.
+    cmap : str
+        Colormap (default "plasma").
+    figsize : (w, h)
+        Figure size in inches.
+    title : str
+        Plot title.
+    """
+    if "in_fraction" not in df.columns:
+        raise ValueError("df has no 'in_fraction' column — run add_In_fraction(df) first.")
+
+    x_um = np.sort(df["x_um"].unique())
+    y_um = np.sort(df["y_um"].unique())
+    extent = [x_um.min(), x_um.max(), y_um.min(), y_um.max()]
+
+    i_min, j_min = df["i"].min(), df["j"].min()
+    nbx = df["i"].nunique()
+    nby = df["j"].nunique()
+
+    grid = np.full((nbx, nby), np.nan)
+    for _, row in df.iterrows():
+        grid[int(row["i"] - i_min), int(row["j"] - j_min)] = row["in_fraction"]
+
+    data = grid.T
+    lo = np.nanpercentile(data[np.isfinite(data)], percentile_clip[0])
+    hi = np.nanpercentile(data[np.isfinite(data)], percentile_clip[1])
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(data, origin="lower", aspect="equal",
+                   extent=extent, cmap=cmap, vmin=lo, vmax=hi)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("In fraction  x", fontsize=10)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel("x (µm)")
+    ax.set_ylabel("y (µm)")
     plt.tight_layout()
     return fig

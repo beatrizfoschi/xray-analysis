@@ -14,7 +14,7 @@ stack = create_virtual_stack(
 from lauexplore.scan import Scan
 scan = Scan.from_h5("scan.h5")
 
-df = run_pipeline(
+df = run_spot_pipeline(
     img_source   = stack,
     scan         = scan,
     roi_center   = (534, 993),    # (x, y) XMAS 1-based from roi_viewer
@@ -23,11 +23,12 @@ df = run_pipeline(
 )
 
 # 3. Plot maps
-plot_maps(df, scan)
+plot_spot_maps(df, scan)
 """
 
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -102,31 +103,12 @@ def create_virtual_stack(
 
 # ── ROI crop ──────────────────────────────────────────────────────────────────
 
-def _crop_roi(
-    img:        np.ndarray,
-    cen_row:    int,
-    cen_col:    int,
-    boxsize:    int,
-) -> np.ndarray:
-    """Crop a (2*boxsize+1) × (2*boxsize+1) region, zero-padding at borders."""
-    r0 = max(0, cen_row - boxsize)
-    r1 = min(img.shape[0], cen_row + boxsize + 1)
-    c0 = max(0, cen_col - boxsize)
-    c1 = min(img.shape[1], cen_col + boxsize + 1)
-    roi = img[r0:r1, c0:c1]
-
-    pad_top    = max(0, boxsize - cen_row)
-    pad_bottom = max(0, (cen_row + boxsize + 1) - img.shape[0])
-    pad_left   = max(0, boxsize - cen_col)
-    pad_right  = max(0, (cen_col + boxsize + 1) - img.shape[1])
-    if any([pad_top, pad_bottom, pad_left, pad_right]):
-        roi = np.pad(roi, ((pad_top, pad_bottom), (pad_left, pad_right)))
-    return roi
+from laue._imaging import crop_roi as _crop_roi
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def run_pipeline(
+def run_spot_pipeline(
     img_source:    str | Path,
     scan,                               # lauexplore Scan object
     roi_center:    tuple[int, int],
@@ -137,6 +119,7 @@ def run_pipeline(
     coords:        str = "xmas",        # "xmas" (1-based) or "numpy" (0-based)
     scan_subset:   tuple[int, int, int, int] | None = None,
     workers:       int = 8,
+    mask:          np.ndarray | None = None,
     **spot_kwargs,
 ) -> pd.DataFrame:
     """Run the spot morphology pipeline over a (sub)set of scan positions.
@@ -169,15 +152,20 @@ def run_pipeline(
         None = full scan.
     workers : int
         Number of parallel threads for H5 reading.
+    mask : np.ndarray of bool, shape (n_frames,), optional
+        True = process, False = skip. Indexed by the linear frame index
+        (same as scan.ij_to_index). Skipped positions appear in the
+        DataFrame with status="masked" and NaN metrics, keeping the grid
+        complete for plotting.
     **spot_kwargs
         Extra keyword arguments forwarded to ``analyze_spot``.
 
     Returns
     -------
     pd.DataFrame with columns:
-        i, j, frame_idx, x_um, y_um,
+        i, j, frame_idx, x_um, y_um, status,
         x_com, y_com, x_com_rel, y_com_rel,
-        lambda1, lambda2, aspect_ratio, theta,
+        lambda1, lambda2, fwhm1, fwhm2, aspect_ratio, theta,
         streak_D50, streak_D95, core_tail_ratio
     """
     img_source = Path(img_source)
@@ -235,7 +223,46 @@ def run_pipeline(
     ]
     n_pos = len(positions)
     mode_label = "direct" if direct_mode else "virtual stack"
-    print(f"Running pipeline on {n_pos} positions  ({i1-i0} × {j1-j0})  [{mode_label}]...")
+
+    # Split off masked positions up front — they skip H5 reads entirely and
+    # are appended as NaN-metric rows so the scan grid stays complete for plotting.
+    active_positions: list[tuple[int, int]] = []
+    masked_rows: list[dict] = []
+    for i, j in positions:
+        idx = scan.ij_to_index(i, j)
+        if mask is not None and not mask[idx]:
+            x_um, y_um = scan.ij_to_xy(i, j)
+            masked_rows.append({
+                "i":         i,
+                "j":         j,
+                "frame_idx": idx,
+                "x_um":      float(x_um) * 1e3,
+                "y_um":      float(y_um) * 1e3,
+                "status":    "masked",
+            })
+        else:
+            active_positions.append((i, j))
+
+    n_active  = len(active_positions)
+    n_masked  = n_pos - n_active
+    mask_info = f",  masked={n_masked}" if mask is not None else ""
+    print(f"Running pipeline on {n_pos} positions  ({i1-i0} × {j1-j0})  [{mode_label}{mask_info}]...")
+
+    # Virtual-stack mode: reopening the same H5 file on every call serialises
+    # all threads behind repeated open overhead. Cache one handle per worker
+    # thread instead, opened lazily on first use.
+    _thread_local  = threading.local()
+    _stack_handles: list[h5py.File] = []
+    _stack_lock    = threading.Lock()
+
+    def _get_stack_handle() -> h5py.File:
+        h5f = getattr(_thread_local, "h5f", None)
+        if h5f is None:
+            h5f = h5py.File(img_source, "r")
+            _thread_local.h5f = h5f
+            with _stack_lock:
+                _stack_handles.append(h5f)
+        return h5f
 
     def _process_one(ij: tuple[int, int]) -> dict:
         i, j       = ij
@@ -247,8 +274,8 @@ def run_pipeline(
                 roi = (ds[0, row_slice, col_slice] if squeeze
                        else ds[row_slice, col_slice]).astype(np.float64)
         else:
-            with h5py.File(img_source, "r") as h5f:
-                roi = h5f[h5_img_key][idx, row_slice, col_slice].astype(np.float64)
+            h5f = _get_stack_handle()
+            roi = h5f[h5_img_key][idx, row_slice, col_slice].astype(np.float64)
         if needs_pad:
             roi = np.pad(roi, ((pad_top, pad_bottom), (pad_left, pad_right)))
         metrics = analyze_spot(roi, **spot_kwargs)
@@ -258,16 +285,22 @@ def run_pipeline(
             "frame_idx": idx,
             "x_um":      float(x_um) * 1e3,
             "y_um":      float(y_um) * 1e3,
+            "status":    "ok",
             **metrics,
         }
 
-    rows = [None] * n_pos
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_process_one, ij): k for k, ij in enumerate(positions)}
-        with tqdm(total=n_pos, desc="Analysing spots", unit="spot") as pbar:
-            for future in as_completed(futures):
-                rows[futures[future]] = future.result()
-                pbar.update(1)
+    rows = list(masked_rows)
+    if active_positions:
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_process_one, ij) for ij in active_positions}
+                with tqdm(total=n_active, desc="Analysing spots", unit="spot") as pbar:
+                    for future in as_completed(futures):
+                        rows.append(future.result())
+                        pbar.update(1)
+        finally:
+            for h5f in _stack_handles:
+                h5f.close()
 
     df = pd.DataFrame(rows)
     df.sort_values(["i", "j"], inplace=True, ignore_index=True)
@@ -286,7 +319,7 @@ def compute_theta_gradient(df: pd.DataFrame) -> pd.DataFrame:
     Parameters
     ----------
     df : DataFrame
-        Output of ``run_pipeline`` (must contain i, j, theta columns).
+        Output of ``run_spot_pipeline`` (must contain i, j, theta columns).
 
     Returns
     -------
@@ -328,6 +361,8 @@ _DEFAULT_METRICS = [
     # Layer 1 — essential core
     ("streak_D95",       "Streak length D95 (px)",      "inferno"),
     ("theta",            "Streak angle θ (°)",          "hsv"),
+    ("fwhm1",            "FWHM major axis (px)",        "viridis"),
+    ("fwhm2",            "FWHM minor axis (px)",        "viridis"),
     ("aspect_ratio",     "Aspect ratio λ₁/λ₂",         "plasma"),
     ("x_com_rel",        "COM displacement x (px)",     "RdBu"),
     ("y_com_rel",        "COM displacement y (px)",     "RdBu"),
@@ -345,7 +380,7 @@ _DEFAULT_METRICS = [
 ]
 
 
-def plot_maps(
+def plot_spot_maps(
     df:                 pd.DataFrame,
     scan,
     metrics:            list[tuple[str, str, str]] | None = None,
@@ -359,7 +394,7 @@ def plot_maps(
     Parameters
     ----------
     df : DataFrame
-        Output of run_pipeline.
+        Output of run_spot_pipeline.
     scan : lauexplore.scan.Scan
         Scan object for physical axis labels.
     metrics : list of (column, title, cmap) or None
@@ -393,7 +428,8 @@ def plot_maps(
     if figsize is None:
         figsize = (ncols * panel_w + ncols * 0.5, nrows * (panel_h + 1.5))
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False,
+                             constrained_layout=True)
 
     i_min, j_min = df["i"].min(), df["j"].min()
     nbx, nby     = df["i"].nunique(), df["j"].nunique()
@@ -422,5 +458,4 @@ def plot_maps(
     for idx in range(n, nrows * ncols):
         axes[idx // ncols, idx % ncols].set_visible(False)
 
-    plt.tight_layout()
     return fig
