@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xray-analysis"
+version = "0.1.0"
+description = "Analysis code for synchrotron X-ray diffraction and emission experiments (ESRF/BM32)."
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+authors = [
+  { name = "Beatriz G Foschiani", email = "beatrizgfoschiani@gmail.com" },
+]
+
+dependencies = [
+  # LaueTools 3.1.44 imports the private numpy.linalg.linalg, removed in numpy 2.0
+  "numpy<2",
+  "scipy",
+  "matplotlib",
+  "pandas",
+  "h5py",
+  "scikit-image",
+  "scikit-learn",
+  "tqdm",
+  "threadpoolctl",
+  "fabio",
+  "pillow",
+  "plotly",
+  "ipython",
+  "ipywidgets",
+  # pinned, not >=: xray-analysis imports private lauexplore API
+  # (plots.base._as_grid, _parsers._fitfile, _parsers._h5), which carries no
+  # compatibility guarantee. Bump deliberately after checking those three.
+  "lauexplore==1.0.8",
+  "lauetools",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/beatrizfoschi/xray-analysis"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["laue*", "emission*", "utils*", "pipelines*"]
+exclude = ["*.tests", "*.tests.*"]
+
+[tool.uv]
+# wxPython publishes no Linux wheels: on a cluster node uv would fall back to the
+# 58 MB sdist, which needs GTK3 dev headers to build. None of the LaueTools
+# modules this repo imports (dict_LaueTools, CrystalParameters, lauecore,
+# IOLaueTools, LaueGeometry) touch wx, so it is dropped there.
+override-dependencies = ["wxpython; sys_platform != 'linux'"]
