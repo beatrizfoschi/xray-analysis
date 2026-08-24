@@ -181,7 +181,7 @@ def load_fit_peaklist(fit_path) -> pd.DataFrame:
     Energy, Xexp, Yexp, Xtheo, Ytheo. Inspect ``.columns`` before relying on a
     name — LaueTools versions differ.
     """
-    from lauexplore._parsers._fitfile import FitFile
+    from lauexplore import FitFile
 
     return FitFile(str(fit_path)).peaklist
 
@@ -196,7 +196,7 @@ def load_calibration_from_fit(fit_path) -> dict:
     The UB here is the orientation of the crystal that was indexed; see
     `geometry.lab_vectors_from_UB` for applying the lattice metric to it.
     """
-    from lauexplore._parsers._fitfile import FitFile
+    from lauexplore import FitFile
 
     fit = FitFile(str(fit_path))
     framedim = fit.CCDdict['framedim']
