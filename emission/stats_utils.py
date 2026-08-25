@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from scipy import ndimage as ndi
 import skimage.filters as filters
-from skimage.morphology import remove_small_objects, binary_opening, disk, binary_closing
+from skimage.morphology import remove_small_objects, opening, disk, binary_closing
 from skimage.measure import label, regionprops
 import matplotlib.patches as mpatches
 from skimage.segmentation import watershed
@@ -66,13 +66,17 @@ def segment_leds(
 
     binary_full = img >= thr
 
-    binary = binary_opening(binary_full, disk(opening_radius))
-    binary = remove_small_objects(binary, min_size=min_area)
+    binary = opening(binary_full, disk(opening_radius))
+    # skimage >=0.26 removed min_size (excludes strictly < N) in favour of
+    # max_size (excludes <= N) — the -1 preserves "keep objects >= min_area",
+    # the contract this function's own docstring promises. A bare rename would
+    # silently drop any region of exactly min_area pixels.
+    binary = remove_small_objects(binary, max_size=min_area - 1)
 
     labels = label(binary)
 
     if fill_gaps:
-        binary_full = remove_small_objects(binary_full, min_size=min_area // 4)
+        binary_full = remove_small_objects(binary_full, max_size=min_area // 4 - 1)
         labels = watershed(sobel(img), markers=labels, mask=binary_full)
 
     regions = regionprops(labels, intensity_image=img)
