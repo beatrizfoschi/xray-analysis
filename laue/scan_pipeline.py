@@ -1,5 +1,11 @@
 """
-scan_pipeline.py — Scan-level pipeline for Laue spot morphology analysis.
+scan_pipeline.py — Scan-level pipeline for per-position Laue spot analysis.
+
+Reads one ROI per scan position and hands it to an analysis function:
+``spot_metrics.analyze_spot`` by default, ``spot_fit.fit_spot`` for the
+parametric multi-Gaussian fit. Everything around that — HDF5 access in either
+layout, the thread pool, the grid bookkeeping, the masked positions, the maps —
+is shared, so a new per-ROI analysis is one ``analysis_fn=`` away.
 
 Typical workflow
 ----------------
@@ -24,13 +30,33 @@ df = run_spot_pipeline(
 
 # 3. Plot maps
 plot_spot_maps(df, scan)
+
+# Same pipeline, parametric fit instead of moments: one ROI, N chosen per
+# position, and the maps follow the columns the fit returns.
+from laue.spot_fit import fit_spot
+
+df_fit = run_spot_pipeline(
+    img_source  = stack,
+    scan        = scan,
+    roi_center  = (534, 993),
+    boxsize     = 25,
+    analysis_fn = fit_spot,
+    n_components= "auto",     # forwarded to fit_spot
+    criterion   = "bic",
+)
+plot_spot_maps(df_fit, scan)
 """
 
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 from pathlib import Path
+from typing import Callable
 
 import h5py
 import matplotlib.pyplot as plt
@@ -106,6 +132,360 @@ def create_virtual_stack(
 from laue._imaging import crop_roi as _crop_roi
 
 
+# ── Worker plumbing ───────────────────────────────────────────────────────────
+#
+# All of this lives at module level because a process pool pickles what it runs,
+# and a closure cannot be pickled. Windows compounds it: processes start by
+# spawning, so each worker re-imports this module rather than inheriting the
+# parent's memory, and anything it needs has to survive a round trip through
+# pickle. That is also why the scan object stays in the parent — positions are
+# resolved to plain (index, x, y) tuples before they are handed out.
+
+class _RoiReader:
+    """Reads one ROI per frame index, holding its HDF5 handle open.
+
+    Opening the file per call serialises workers behind repeated open overhead,
+    so the handle is cached — but an h5py handle survives neither a pickle nor a
+    fork, so the cache is deliberately dropped on serialisation and reopened on
+    first use in whatever thread or process ends up doing the reading.
+    """
+
+    def __init__(self, img_source, *, direct_mode, files, h5_img_key,
+                 direct_h5_key, squeeze, row_slice, col_slice, pad):
+        self.img_source    = img_source
+        self.direct_mode   = direct_mode
+        self.files         = files
+        self.h5_img_key    = h5_img_key
+        self.direct_h5_key = direct_h5_key
+        self.squeeze       = squeeze
+        self.row_slice     = row_slice
+        self.col_slice     = col_slice
+        self.pad           = pad          # (top, bottom, left, right) or None
+        self._local        = threading.local()
+        self._handles: list = []
+        self._lock         = threading.Lock()
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        for key in ("_local", "_handles", "_lock"):
+            state.pop(key, None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._local   = threading.local()
+        self._handles = []
+        self._lock    = threading.Lock()
+
+    def read(self, idx: int) -> np.ndarray:
+        if self.direct_mode:
+            # One file per frame: nothing to keep open between calls.
+            with h5py.File(self.files[idx], "r") as h5f:
+                ds  = h5f[self.direct_h5_key]
+                roi = (ds[0, self.row_slice, self.col_slice] if self.squeeze
+                       else ds[self.row_slice, self.col_slice]).astype(np.float64)
+        else:
+            h5f = getattr(self._local, "h5f", None)
+            if h5f is None:
+                h5f = h5py.File(self.img_source, "r")
+                self._local.h5f = h5f
+                with self._lock:
+                    self._handles.append(h5f)
+            roi = h5f[self.h5_img_key][idx, self.row_slice, self.col_slice].astype(np.float64)
+
+        if self.pad is not None:
+            top, bottom, left, right = self.pad
+            roi = np.pad(roi, ((top, bottom), (left, right)))
+        return roi
+
+    def close(self) -> None:
+        with self._lock:
+            for h5f in self._handles:
+                h5f.close()
+            self._handles.clear()
+
+
+def _analyse_one(task, reader: _RoiReader, analysis_fn, spot_kwargs: dict) -> dict:
+    i, j, idx, x_um, y_um = task
+    metrics = analysis_fn(reader.read(idx), **spot_kwargs)
+    return {
+        "i":         i,
+        "j":         j,
+        "frame_idx": idx,
+        "x_um":      x_um,
+        "y_um":      y_um,
+        "status":    "ok",
+        **metrics,
+    }
+
+
+# Set once per worker process by the pool initialiser; unused by the thread path,
+# which passes the same three objects explicitly instead.
+_WORKER_CONTEXT: tuple | None = None
+
+
+def _init_worker(reader: _RoiReader, analysis_fn, spot_kwargs: dict) -> None:
+    global _WORKER_CONTEXT
+    _WORKER_CONTEXT = (reader, analysis_fn, spot_kwargs)
+
+
+def _analyse_one_pooled(task) -> dict:
+    return _analyse_one(task, *_WORKER_CONTEXT)
+
+
+def _analyse_array(task, analysis_fn, spot_kwargs: dict) -> tuple[int, dict]:
+    k, roi = task
+    return k, analysis_fn(roi, **spot_kwargs)
+
+
+def _analyse_array_pooled(task) -> tuple[int, dict]:
+    _, analysis_fn, spot_kwargs = _WORKER_CONTEXT
+    return _analyse_array(task, analysis_fn, spot_kwargs)
+
+
+def _use_processes(executor: str, analysis_fn) -> bool:
+    if executor == "auto":
+        return analysis_fn is not analyze_spot
+    if executor in ("thread", "process"):
+        return executor == "process"
+    raise ValueError(
+        f'executor must be "auto", "thread" or "process", got {executor!r}'
+    )
+
+
+def _prepare_reader(
+    img_source,
+    roi_center: tuple[int, int],
+    boxsize: int,
+    *,
+    h5_img_key: str,
+    direct_h5_key: str,
+    coords: str,
+) -> tuple[_RoiReader, str]:
+    """Resolve the image source and ROI geometry into a reader.
+
+    Shared by `run_spot_pipeline` and `read_roi_stack` so that a ROI means the
+    same pixels either way — the clamping and the zero padding at a detector edge
+    included.
+    """
+    img_source  = Path(img_source)
+    direct_mode = img_source.is_dir()
+
+    x, y    = roi_center
+    cen_col = (x - 1) if coords == "xmas" else x
+    cen_row = (y - 1) if coords == "xmas" else y
+
+    if direct_mode:
+        files = sorted(
+            img_source.glob("*.h5"),
+            key=lambda p: int(p.stem.split("_")[-1])
+        )
+        if not files:
+            raise FileNotFoundError(f"No .h5 files found in {img_source}")
+        with h5py.File(files[0], "r") as h5f:
+            src_shape = h5f[direct_h5_key].shape   # (1, H, W) or (H, W)
+        squeeze = len(src_shape) == 3
+        H, W    = src_shape[-2], src_shape[-1]
+        print(f"Direct mode: {len(files)} files, detector {H}×{W}")
+    else:
+        files   = None
+        squeeze = False
+        with h5py.File(img_source, "r") as h5f:
+            _, H, W = h5f[h5_img_key].shape
+
+    # Read only the ROI pixels, never the whole frame.
+    row_slice = slice(max(0, cen_row - boxsize), min(H, cen_row + boxsize + 1))
+    col_slice = slice(max(0, cen_col - boxsize), min(W, cen_col + boxsize + 1))
+
+    pad = (
+        max(0, boxsize - cen_row),
+        max(0, (cen_row + boxsize + 1) - H),
+        max(0, boxsize - cen_col),
+        max(0, (cen_col + boxsize + 1) - W),
+    )
+    reader = _RoiReader(
+        img_source,
+        direct_mode=direct_mode,
+        files=files,
+        h5_img_key=h5_img_key,
+        direct_h5_key=direct_h5_key,
+        squeeze=squeeze,
+        row_slice=row_slice,
+        col_slice=col_slice,
+        pad=pad if any(pad) else None,
+    )
+    return reader, ("direct" if direct_mode else "virtual stack")
+
+
+def _resolve_positions(scan, scan_subset, mask):
+    """Turn the scan grid into worker tasks of plain numbers.
+
+    Every call into the scan object happens here, in the parent process, so the
+    scan itself never has to cross into a worker. Masked positions become rows
+    carrying no metric keys at all; pandas fills those columns with NaN, which is
+    what keeps the grid rectangular for plotting.
+    """
+    if scan_subset is not None:
+        i0, i1, j0, j1 = scan_subset
+    else:
+        i0, i1 = 0, scan.nbxpoints
+        j0, j1 = 0, scan.nbypoints
+
+    active_tasks: list[tuple] = []
+    masked_rows: list[dict] = []
+    n_pos = 0
+    for i in range(i0, i1):
+        for j in range(j0, j1):
+            n_pos += 1
+            idx = int(scan.ij_to_index(i, j))
+            x_um, y_um = scan.ij_to_xy(i, j)
+            x_um, y_um = float(x_um) * 1e3, float(y_um) * 1e3
+            if mask is not None and not mask[idx]:
+                masked_rows.append({
+                    "i": i, "j": j, "frame_idx": idx,
+                    "x_um": x_um, "y_um": y_um, "status": "masked",
+                })
+            else:
+                active_tasks.append((i, j, idx, x_um, y_um))
+
+    return active_tasks, masked_rows, n_pos, (i0, i1, j0, j1)
+
+
+# ── Reading a stack into memory ───────────────────────────────────────────────
+
+def read_roi_stack(
+    img_source:    str | Path,
+    scan,
+    roi_center:    tuple[int, int],
+    boxsize:       int,
+    *,
+    h5_img_key:    str = "frames",
+    direct_h5_key: str = "entry_0000/CRGIF/eiger4m/data",
+    coords:        str = "xmas",
+    scan_subset:   tuple[int, int, int, int] | None = None,
+    workers:       int = 8,
+    dtype=np.float32,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Read one ROI per scan position into a single array.
+
+    `run_spot_pipeline` streams positions and never holds more than one crop, so
+    it cannot support anything that needs to see the whole scan at once —
+    sub-pixel alignment against a common reference above all. This is the way in
+    for those: read once, operate on the stack, then analyse it with
+    `analyse_stack`.
+
+    Only worth it when something really is stack-level. A ROI of
+    ``(2·boxsize+1)²`` float32 over a few thousand positions is small (a 41x41
+    crop over 5000 positions is ~34 MB), but the whole point of the streaming
+    pipeline is not needing that.
+
+    Returns
+    -------
+    stack : (n_positions, h, w) array, in the row order of ``index``.
+    index : DataFrame with ``i, j, frame_idx, x_um, y_um`` — the grid coordinates
+        of each slice, ready to be concatenated with per-position results.
+    """
+    reader, mode_label = _prepare_reader(
+        img_source, roi_center, boxsize,
+        h5_img_key=h5_img_key, direct_h5_key=direct_h5_key, coords=coords,
+    )
+    tasks, _, n_pos, (i0, i1, j0, j1) = _resolve_positions(scan, scan_subset, None)
+    print(f"Reading {n_pos} ROIs  ({i1-i0} × {j1-j0})  [{mode_label}]...")
+
+    side  = 2 * boxsize + 1
+    stack = np.empty((len(tasks), side, side), dtype=dtype)
+    try:
+        # Reads release the GIL, so threads overlap them; the ROIs would have to
+        # be pickled back out of a process pool for no gain.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(reader.read, task[2]): k
+                for k, task in enumerate(tasks)
+            }
+            with tqdm(total=len(tasks), desc="Reading ROIs", unit="roi") as pbar:
+                for future in as_completed(futures):
+                    stack[futures[future]] = future.result()
+                    pbar.update(1)
+    finally:
+        reader.close()
+
+    index = pd.DataFrame(
+        [{"i": i, "j": j, "frame_idx": idx, "x_um": x, "y_um": y}
+         for i, j, idx, x, y in tasks]
+    )
+    return stack, index
+
+
+def analyse_stack(
+    stack:       np.ndarray,
+    index:       pd.DataFrame | None = None,
+    *,
+    analysis_fn: Callable[..., dict] = analyze_spot,
+    workers:     int = 8,
+    executor:    str = "auto",
+    **spot_kwargs,
+) -> pd.DataFrame:
+    """Run a per-ROI analysis over a stack already in memory.
+
+    The stack-level counterpart of `run_spot_pipeline`, for when the ROIs have
+    been through something that needed all of them at once — `_imaging.align_stack`
+    being the case this exists for. Same analysis functions, same executor
+    trade-off, same DataFrame out.
+
+    Parameters
+    ----------
+    stack : (n, h, w) array
+    index : DataFrame, optional
+        Grid coordinates for each slice, as returned by `read_roi_stack`. Joined
+        onto the results so the output can be mapped; without it the rows carry
+        only a ``frame`` counter and `plot_spot_maps` has nothing to place them on.
+    executor : {"auto", "thread", "process"}
+        As in `run_spot_pipeline`, including the ``if __name__ == "__main__":``
+        a process pool needs when this is called from a script.
+    """
+    stack = np.asarray(stack)
+    if stack.ndim != 3:
+        raise ValueError(f"stack must be (n, h, w), got shape {stack.shape}")
+    if index is not None and len(index) != len(stack):
+        raise ValueError(
+            f"index has {len(index)} rows but the stack has {len(stack)} frames"
+        )
+
+    use_processes = _use_processes(executor, analysis_fn)
+    print(f"Analysing {len(stack)} ROIs  "
+          f"[{workers} {'processes' if use_processes else 'threads'}]...")
+
+    tasks = [(k, np.asarray(stack[k], dtype=np.float64)) for k in range(len(stack))]
+    results: list[dict | None] = [None] * len(stack)
+
+    if use_processes:
+        pool = ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_worker,
+            initargs=(None, analysis_fn, spot_kwargs),
+        )
+        submit = lambda task: pool.submit(_analyse_array_pooled, task)
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        submit = lambda task: pool.submit(
+            _analyse_array, task, analysis_fn, spot_kwargs
+        )
+    with pool:
+        futures = {submit(task) for task in tasks}
+        with tqdm(total=len(tasks), desc="Analysing ROIs", unit="roi") as pbar:
+            for future in as_completed(futures):
+                k, metrics = future.result()
+                results[k] = metrics
+                pbar.update(1)
+
+    df = pd.DataFrame(results)
+    df.insert(0, "frame", np.arange(len(stack)))
+    df["status"] = "ok"
+    if index is not None:
+        df = pd.concat([index.reset_index(drop=True), df.drop(columns="frame")], axis=1)
+    return df
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def run_spot_pipeline(
@@ -120,9 +500,11 @@ def run_spot_pipeline(
     scan_subset:   tuple[int, int, int, int] | None = None,
     workers:       int = 8,
     mask:          np.ndarray | None = None,
+    analysis_fn:   Callable[..., dict] = analyze_spot,
+    executor:      str = "auto",
     **spot_kwargs,
 ) -> pd.DataFrame:
-    """Run the spot morphology pipeline over a (sub)set of scan positions.
+    """Run a per-position spot analysis over a (sub)set of scan positions.
 
     Parameters
     ----------
@@ -157,150 +539,91 @@ def run_spot_pipeline(
         (same as scan.ij_to_index). Skipped positions appear in the
         DataFrame with status="masked" and NaN metrics, keeping the grid
         complete for plotting.
+    analysis_fn : callable
+        What to run on each ROI: takes the 2-D crop plus ``**spot_kwargs`` and
+        returns a flat dict, which becomes the metric columns of the row.
+        ``spot_metrics.analyze_spot`` (the default) for moment-based morphology,
+        ``spot_fit.fit_spot`` for the parametric multi-Gaussian fit.
+
+        Whatever is passed has to be a *per-position* function. An operation that
+        needs the whole stack — sub-pixel alignment against a common reference,
+        for one — cannot go here, because positions are read and analysed one at
+        a time and never held together. Run `_imaging.align_stack` as a pre-pass
+        instead; see its docstring for which metrics that actually affects.
+
+        With ``executor="process"`` the function is pickled, so it has to be
+        importable by name: a module-level function, not a lambda or a closure.
+        ``functools.partial`` over a module-level function is fine.
+    executor : {"auto", "thread", "process"}
+        Threads share the interpreter, so they overlap the HDF5 reads but not
+        Python-level computation — everything holding the GIL still runs one at a
+        time. That is the right trade for ``analyze_spot``, which is dominated by
+        the reads. An iterative fit is not: ``fit_spot`` measured ~4 positions/s
+        against ~91 for ``analyze_spot`` through the same thread pool, and only
+        separate processes recover the cores.
+
+        ``"auto"`` picks threads for ``analyze_spot`` and processes for anything
+        else. Override it when the guess is wrong — a cheap custom ``analysis_fn``
+        is better off in threads, where there is no pickling and no start-up cost.
+
+        From a **script**, a process pool needs the call to sit behind
+        ``if __name__ == "__main__":``. Windows starts workers by spawning, and a
+        worker re-imports the module it was started from; without the guard it
+        re-runs the script and spawns again. Notebooks are unaffected — the
+        worker imports an empty ``__mp_main__``.
     **spot_kwargs
-        Extra keyword arguments forwarded to ``analyze_spot``.
+        Extra keyword arguments forwarded to ``analysis_fn``. With
+        ``executor="process"`` these are pickled too, so keep them to plain data.
 
     Returns
     -------
-    pd.DataFrame with columns:
-        i, j, frame_idx, x_um, y_um, status,
-        x_com, y_com, x_com_rel, y_com_rel,
-        lambda1, lambda2, fwhm1, fwhm2, aspect_ratio, theta,
-        streak_D50, streak_D95, core_tail_ratio
+    pd.DataFrame with columns ``i, j, frame_idx, x_um, y_um, status`` plus
+    whatever keys ``analysis_fn`` returns — the Layer 1-3 morphology indicators
+    for ``analyze_spot``, the fitted components for ``fit_spot``.
     """
-    img_source = Path(img_source)
-    direct_mode = img_source.is_dir()
+    reader, mode_label = _prepare_reader(
+        img_source, roi_center, boxsize,
+        h5_img_key=h5_img_key, direct_h5_key=direct_h5_key, coords=coords,
+    )
+    active_tasks, masked_rows, n_pos, extent = _resolve_positions(
+        scan, scan_subset, mask
+    )
+    i0, i1, j0, j1 = extent
 
-    # Coordinate conversion
-    x, y    = roi_center
-    cen_col = (x - 1) if coords == "xmas" else x
-    cen_row = (y - 1) if coords == "xmas" else y
-
-    # Resolve file list and detector shape
-    if direct_mode:
-        files = sorted(
-            img_source.glob("*.h5"),
-            key=lambda p: int(p.stem.split("_")[-1])
-        )
-        if not files:
-            raise FileNotFoundError(f"No .h5 files found in {img_source}")
-        with h5py.File(files[0], "r") as h5f:
-            src_shape = h5f[direct_h5_key].shape   # (1, H, W) or (H, W)
-        squeeze = len(src_shape) == 3
-        H, W    = src_shape[-2], src_shape[-1]
-        print(f"Direct mode: {len(files)} files, detector {H}×{W}")
-    else:
-        files  = None
-        squeeze = False
-        with h5py.File(img_source, "r") as h5f:
-            _, H, W = h5f[h5_img_key].shape
-
-    # Pre-compute clamped ROI slices (read only ROI pixels, not the full frame)
-    r0_src = max(0, cen_row - boxsize)
-    r1_src = min(H, cen_row + boxsize + 1)
-    c0_src = max(0, cen_col - boxsize)
-    c1_src = min(W, cen_col + boxsize + 1)
-    row_slice = slice(r0_src, r1_src)
-    col_slice = slice(c0_src, c1_src)
-
-    pad_top    = max(0, boxsize - cen_row)
-    pad_bottom = max(0, (cen_row + boxsize + 1) - H)
-    pad_left   = max(0, boxsize - cen_col)
-    pad_right  = max(0, (cen_col + boxsize + 1) - W)
-    needs_pad  = any([pad_top, pad_bottom, pad_left, pad_right])
-
-    # Subset bounds
-    if scan_subset is not None:
-        i0, i1, j0, j1 = scan_subset
-    else:
-        i0, i1 = 0, scan.nbxpoints
-        j0, j1 = 0, scan.nbypoints
-
-    positions = [
-        (i, j)
-        for i in range(i0, i1)
-        for j in range(j0, j1)
-    ]
-    n_pos = len(positions)
-    mode_label = "direct" if direct_mode else "virtual stack"
-
-    # Split off masked positions up front — they skip H5 reads entirely and
-    # are appended as NaN-metric rows so the scan grid stays complete for plotting.
-    active_positions: list[tuple[int, int]] = []
-    masked_rows: list[dict] = []
-    for i, j in positions:
-        idx = scan.ij_to_index(i, j)
-        if mask is not None and not mask[idx]:
-            x_um, y_um = scan.ij_to_xy(i, j)
-            masked_rows.append({
-                "i":         i,
-                "j":         j,
-                "frame_idx": idx,
-                "x_um":      float(x_um) * 1e3,
-                "y_um":      float(y_um) * 1e3,
-                "status":    "masked",
-            })
-        else:
-            active_positions.append((i, j))
-
-    n_active  = len(active_positions)
+    n_active  = len(active_tasks)
     n_masked  = n_pos - n_active
     mask_info = f",  masked={n_masked}" if mask is not None else ""
-    print(f"Running pipeline on {n_pos} positions  ({i1-i0} × {j1-j0})  [{mode_label}{mask_info}]...")
 
-    # Virtual-stack mode: reopening the same H5 file on every call serialises
-    # all threads behind repeated open overhead. Cache one handle per worker
-    # thread instead, opened lazily on first use.
-    _thread_local  = threading.local()
-    _stack_handles: list[h5py.File] = []
-    _stack_lock    = threading.Lock()
+    use_processes = _use_processes(executor, analysis_fn)
+    pool_label = "processes" if use_processes else "threads"
 
-    def _get_stack_handle() -> h5py.File:
-        h5f = getattr(_thread_local, "h5f", None)
-        if h5f is None:
-            h5f = h5py.File(img_source, "r")
-            _thread_local.h5f = h5f
-            with _stack_lock:
-                _stack_handles.append(h5f)
-        return h5f
-
-    def _process_one(ij: tuple[int, int]) -> dict:
-        i, j       = ij
-        idx        = scan.ij_to_index(i, j)
-        x_um, y_um = scan.ij_to_xy(i, j)
-        if direct_mode:
-            with h5py.File(files[idx], "r") as h5f:
-                ds  = h5f[direct_h5_key]
-                roi = (ds[0, row_slice, col_slice] if squeeze
-                       else ds[row_slice, col_slice]).astype(np.float64)
-        else:
-            h5f = _get_stack_handle()
-            roi = h5f[h5_img_key][idx, row_slice, col_slice].astype(np.float64)
-        if needs_pad:
-            roi = np.pad(roi, ((pad_top, pad_bottom), (pad_left, pad_right)))
-        metrics = analyze_spot(roi, **spot_kwargs)
-        return {
-            "i":         i,
-            "j":         j,
-            "frame_idx": idx,
-            "x_um":      float(x_um) * 1e3,
-            "y_um":      float(y_um) * 1e3,
-            "status":    "ok",
-            **metrics,
-        }
+    print(f"Running pipeline on {n_pos} positions  ({i1-i0} × {j1-j0})  "
+          f"[{mode_label}{mask_info},  {workers} {pool_label}]...")
 
     rows = list(masked_rows)
-    if active_positions:
+    if active_tasks:
         try:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(_process_one, ij) for ij in active_positions}
+            if use_processes:
+                pool = ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=_init_worker,
+                    initargs=(reader, analysis_fn, spot_kwargs),
+                )
+                submit = lambda task: pool.submit(_analyse_one_pooled, task)
+            else:
+                pool = ThreadPoolExecutor(max_workers=workers)
+                submit = lambda task: pool.submit(
+                    _analyse_one, task, reader, analysis_fn, spot_kwargs
+                )
+            with pool:
+                futures = {submit(task) for task in active_tasks}
                 with tqdm(total=n_active, desc="Analysing spots", unit="spot") as pbar:
                     for future in as_completed(futures):
                         rows.append(future.result())
                         pbar.update(1)
         finally:
-            for h5f in _stack_handles:
-                h5f.close()
+            # Only the parent's own handles; each worker closes its own on exit.
+            reader.close()
 
     df = pd.DataFrame(rows)
     df.sort_values(["i", "j"], inplace=True, ignore_index=True)
@@ -380,6 +703,31 @@ _DEFAULT_METRICS = [
 ]
 
 
+# Maps for a run with analysis_fn=spot_fit.fit_spot.
+#
+# The label-free quantities come first: `separation`, `orientation` and `ratio`
+# survive both a translation of the crop and a relabelling of the components,
+# while the per-component positions do neither. Components are ordered by
+# amplitude, so where two of them are nearly equally bright the labels can swap
+# between neighbouring positions and speckle the x1/x2 maps without anything
+# physical having changed.
+_FIT_METRICS = [
+    ("separation",      "Sub-peak separation (px)",   "magma"),
+    ("orientation",     "Separation angle (°)",       "twilight"),
+    ("ratio",           "A₂ / (A₁ + A₂)",             "RdBu_r"),
+    ("n_components",    "N components",               "Reds"),
+    ("total_amplitude", "Total amplitude",            "viridis"),
+    ("sigma_x1",        "Width σₓ (px)",              "cividis"),
+    ("sigma_y1",        "Width σᵧ (px)",              "cividis"),
+    ("bg",              "Background",                 "viridis"),
+    ("centroid_x",      "Centroid x (px)",            "viridis"),
+    ("centroid_y",      "Centroid y (px)",            "viridis"),
+    ("x1",              "Peak 1 x (px)",              "viridis"),
+    ("y1",              "Peak 1 y (px)",              "viridis"),
+    ("chi2",            "Reduced χ²",                 "hot"),
+]
+
+
 def plot_spot_maps(
     df:                 pd.DataFrame,
     scan,
@@ -394,11 +742,12 @@ def plot_spot_maps(
     Parameters
     ----------
     df : DataFrame
-        Output of run_spot_pipeline.
+        Output of run_spot_pipeline, from either analysis function.
     scan : lauexplore.scan.Scan
         Scan object for physical axis labels.
     metrics : list of (column, title, cmap) or None
-        Which metrics to plot.  Defaults to all _DEFAULT_METRICS.
+        Which metrics to plot.  When None, picked from the columns present:
+        the fit maps for a ``fit_spot`` run, the morphology maps otherwise.
     ncols : int
         Maximum number of panels per row (default 4).
     percentile_clip : (lo, hi)
@@ -411,7 +760,10 @@ def plot_spot_maps(
     matplotlib Figure
     """
     if metrics is None:
-        metrics = _DEFAULT_METRICS
+        metrics = _FIT_METRICS if "n_components" in df.columns else _DEFAULT_METRICS
+    metrics = [m for m in metrics if m[0] in df.columns]
+    if not metrics:
+        raise ValueError("None of the requested metric columns are in the DataFrame.")
 
     n     = len(metrics)
     ncols = min(ncols, n)

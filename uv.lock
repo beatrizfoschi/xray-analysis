@@ -4995,7 +4995,7 @@ wheels = [
 
 [[package]]
 name = "xray-analysis"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "fabio", version = "2024.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
