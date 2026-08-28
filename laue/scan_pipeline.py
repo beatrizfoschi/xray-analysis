@@ -716,16 +716,16 @@ _DEFAULT_METRICS = [
 # between neighbouring positions and speckle the x1/x2 maps without anything
 # physical having changed.
 #
-# `n_resolved` is the sub-peak count; `n_fitted` is how many Gaussians the fit
-# needed, which is a fit-quality quantity and not a physical one (see
-# spot_fit's module docstring). Both are mapped because reading them together
-# is what tells a genuinely split spot from a streak the model had to tile.
+# `n_resolved` is mapped; `n_fitted` deliberately is not. It is a fit-complexity
+# quantity, not a physical one — most of the components it counts are discarded
+# by the resolvability test — and a map of it sitting beside the sub-peak count
+# reads as a second, contradictory answer to the same question. The column is
+# still there for anyone who asks for it by name.
 _FIT_METRICS = [
     ("separation",      "Sub-peak separation (px)",   "magma"),
     ("orientation",     "Separation angle (°)",       "twilight"),
     ("ratio",           "A₂ / (A₁ + A₂)",             "RdBu_r"),
     ("n_resolved",      "N resolved sub-peaks",       "Reds"),
-    ("n_fitted",        "N fitted Gaussians",         "Purples"),
     ("total_amplitude", "Total amplitude",            "viridis"),
     ("sigma_x1",        "Width σₓ (px)",              "cividis"),
     ("sigma_y1",        "Width σᵧ (px)",              "cividis"),
