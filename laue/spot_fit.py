@@ -53,6 +53,29 @@ overfitting, and its threshold is not portable — it has to be recalibrated by 
 whenever the noise level, the ROI size or the normalisation changes. It is here
 to be compared against, not to be trusted by default.
 
+Counting sub-peaks: ``n_resolved``, not ``n_fitted``
+-----------------------------------------------------
+**The selected N is not the number of sub-peaks, and no choice of criterion makes
+it one.** Model selection answers "how many Gaussians describe this best"; the
+physical question is "how many sub-peaks are there". The two diverge because chi²
+falls just as happily for a component thrown into a heavy tail as for one that
+found a real peak, and BIC and AIC are chi² plus a penalty, so they inherit that.
+
+Measured on the reference spot, over 400 positions: the BIC-selected N agrees
+with a direct count of local maxima on **9%** of them, and calls 92% of positions
+split where the direct count says 12.5%. Two attempts to fix it at the model level
+both failed — giving the components a rotation angle moved single-maximum spots
+from 8.9% to 15.1% of N=1, and a pseudo-Voigt profile with heavy tails beat the
+best multi-Gaussian on 6% of positions.
+
+So the count is taken from resolvability instead, by `_resolved_indices`: a
+component survives if it is bright enough relative to the brightest and if the
+model dips between it and every component already kept. That agrees with the
+direct maxima count on 90.5% of positions. ``n_fitted`` is kept as what it
+actually is — a measure of how much structure the fit needed — and ``separation``,
+``orientation`` and ``ratio`` are reported only where two components are actually
+resolved.
+
 Functions
 ---------
 n_gaussians_2d      The model: N Gaussians + flat background
@@ -87,47 +110,60 @@ _CRITERIA = ("bic", "aic", "chi2")
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
-def _n_from_length(n_params: int, shared_sigma: bool) -> int:
-    """Number of components implied by a parameter-vector length."""
-    if shared_sigma:
-        if n_params < 6 or (n_params - 3) % 3 != 0:
-            raise ValueError(
-                f"{n_params} parameters is not 3n+3 for any n >= 1 "
-                "(shared_sigma=True)"
-            )
-        return (n_params - 3) // 3
-    if n_params < 6 or (n_params - 1) % 5 != 0:
+def _shape_size(rotation: bool) -> int:
+    """Number of shape parameters per shape block: sx, sy and optionally theta."""
+    return 3 if rotation else 2
+
+
+def _n_params(n: int, shared_sigma: bool, rotation: bool) -> int:
+    s = _shape_size(rotation)
+    return (3 * n + s + 1) if shared_sigma else ((3 + s) * n + 1)
+
+
+def _n_from_length(n_params: int, shared_sigma: bool, rotation: bool = False) -> int:
+    """Number of components implied by a parameter-vector length.
+
+    Both flags are needed: 13 parameters is three shared-shape rotated components
+    and also two per-component rotated ones, so the length alone does not say.
+    """
+    s = _shape_size(rotation)
+    per, offset = (3, s + 1) if shared_sigma else (3 + s, 1)
+    if n_params < per + offset or (n_params - offset) % per != 0:
         raise ValueError(
-            f"{n_params} parameters is not 5n+1 for any n >= 1 "
-            "(shared_sigma=False)"
+            f"{n_params} parameters is not {per}n+{offset} for any n >= 1 "
+            f"(shared_sigma={shared_sigma}, rotation={rotation})"
         )
-    return (n_params - 1) // 5
+    return (n_params - offset) // per
 
 
-def _unpack(params: np.ndarray, n: int, shared_sigma: bool):
-    """Split a parameter vector into (centres+amplitudes, sx, sy, background).
+def _unpack(params: np.ndarray, n: int, shared_sigma: bool, rotation: bool = False):
+    """Split a parameter vector into (centres+amplitudes, sx, sy, theta, background).
 
-    Layouts
-    -------
-    shared_sigma=True   [x1, y1, A1, ..., xn, yn, An, sx, sy, bg]     (3n + 3)
-    shared_sigma=False  [x1, y1, A1, sx1, sy1, ..., bg]               (5n + 1)
+    Layouts — ``…`` is the shape block ``sx, sy`` plus ``theta`` when rotating:
 
-    The n=1 case is the same vector either way, which is why the two layouts
-    never collide when the length is used to infer n.
+    shared_sigma=True   [x1, y1, A1, …, xn, yn, An, sx, sy, (theta,) bg]
+    shared_sigma=False  [x1, y1, A1, sx1, sy1, (theta1,) …, bg]
+
+    ``theta`` is in radians and turns the component's own axes, so ``sx`` is the
+    width along that rotated axis rather than along the detector column.
     """
     params = np.asarray(params, dtype=np.float64)
+    s = _shape_size(rotation)
     if shared_sigma:
-        comp = params[: 3 * n].reshape(n, 3)
-        sx = np.full(n, params[3 * n])
-        sy = np.full(n, params[3 * n + 1])
-        bg = params[3 * n + 2]
+        comp  = params[: 3 * n].reshape(n, 3)
+        shape = params[3 * n: 3 * n + s]
+        sx    = np.full(n, shape[0])
+        sy    = np.full(n, shape[1])
+        theta = np.full(n, shape[2] if rotation else 0.0)
+        bg    = params[3 * n + s]
     else:
-        block = params[: 5 * n].reshape(n, 5)
-        comp = block[:, :3]
-        sx = block[:, 3]
-        sy = block[:, 4]
-        bg = params[5 * n]
-    return comp, sx, sy, float(bg)
+        block = params[: (3 + s) * n].reshape(n, 3 + s)
+        comp  = block[:, :3]
+        sx    = block[:, 3]
+        sy    = block[:, 4]
+        theta = block[:, 5] if rotation else np.zeros(n)
+        bg    = params[(3 + s) * n]
+    return comp, sx, sy, theta, float(bg)
 
 
 def n_gaussians_2d(
@@ -136,30 +172,36 @@ def n_gaussians_2d(
     yy: np.ndarray,
     n_components: Optional[int] = None,
     shared_sigma: bool = True,
+    rotation: bool = False,
 ) -> np.ndarray:
     """Sum of ``n_components`` 2-D Gaussians over a flat background.
 
-    Each Gaussian is axis-aligned with its own ``sx``/``sy`` (or a pair shared
-    across components).  There is no rotation term: a tilted single spot is
-    better described by ``spot_metrics.inertia_tensor``, and a tilted *pair* is
-    represented by the positions of the two components, not by their shape.
+    With ``rotation=False`` (the default) each Gaussian is axis-aligned, which is
+    the model notebook 02 used. With ``rotation=True`` the component axes turn by
+    ``theta``, and a single tilted streak becomes one elongated Gaussian instead
+    of a row of round ones — see `fit_spot` for why that changes what the
+    component count means.
 
     ``n_components`` is inferred from ``len(params)`` when omitted, so a
     9-element vector reproduces the two-Gaussian model exactly.
     """
     params = np.asarray(params, dtype=np.float64)
     if n_components is None:
-        n_components = _n_from_length(params.size, shared_sigma)
+        n_components = _n_from_length(params.size, shared_sigma, rotation)
 
-    comp, sx, sy, bg = _unpack(params, n_components, shared_sigma)
+    comp, sx, sy, theta, bg = _unpack(params, n_components, shared_sigma, rotation)
 
     out = np.zeros(np.broadcast(xx, yy).shape, dtype=np.float64)
-    for (x0, y0, amp), sxi, syi in zip(comp, sx, sy):
+    for (x0, y0, amp), sxi, syi, ti in zip(comp, sx, sy, theta):
         sxi = max(sxi, _SIGMA_FLOOR)
         syi = max(syi, _SIGMA_FLOOR)
-        out += amp * np.exp(
-            -((xx - x0) ** 2 / (2 * sxi ** 2) + (yy - y0) ** 2 / (2 * syi ** 2))
-        )
+        dx, dy = xx - x0, yy - y0
+        if rotation:
+            ct, st = np.cos(ti), np.sin(ti)
+            u, v = dx * ct + dy * st, -dx * st + dy * ct
+        else:
+            u, v = dx, dy
+        out += amp * np.exp(-(u ** 2 / (2 * sxi ** 2) + v ** 2 / (2 * syi ** 2)))
     return out + bg
 
 
@@ -171,9 +213,10 @@ def residuals(
     weights: np.ndarray,
     n_components: int,
     shared_sigma: bool,
+    rotation: bool = False,
 ) -> np.ndarray:
     """Weighted (model − data), flattened for ``least_squares``."""
-    model = n_gaussians_2d(params, xx, yy, n_components, shared_sigma)
+    model = n_gaussians_2d(params, xx, yy, n_components, shared_sigma, rotation)
     return (model - data).ravel() * weights.ravel()
 
 
@@ -229,6 +272,20 @@ def _initial_peaks(
     return kept[:n]
 
 
+def _streak_angle(signal: np.ndarray) -> float:
+    """Initial ``theta`` (radians) from the intensity second moments.
+
+    Reuses `spot_metrics`, whose inertia tensor already answers exactly this —
+    the principal axis of the spot — so the rotated fit starts pointing along the
+    streak rather than searching for it.
+    """
+    from laue.spot_metrics import center_of_mass, inertia_tensor
+
+    x_com, y_com = center_of_mass(signal)
+    *_, theta_deg = inertia_tensor(signal, x_com, y_com)
+    return 0.0 if np.isnan(theta_deg) else float(np.radians(theta_deg))
+
+
 def _build_p0_bounds(
     roi: np.ndarray,
     n: int,
@@ -237,6 +294,7 @@ def _build_p0_bounds(
     sigma_bounds: tuple[float, float],
     min_sep: float,
     threshold_rel: float,
+    rotation: bool = False,
 ):
     """Initial vector and box bounds for one fit."""
     h, w = roi.shape
@@ -245,23 +303,29 @@ def _build_p0_bounds(
     signal = np.clip(roi - bg0, 0.0, None)
     peaks = _initial_peaks(signal, n, min_sep=min_sep, threshold_rel=threshold_rel)
 
+    # theta is periodic, so a box bound is only safe centred on the estimate;
+    # +/- pi/2 covers every distinct orientation.
+    t0 = _streak_angle(signal) if rotation else 0.0
+    shape_p0 = [sigma_p0, sigma_p0] + ([t0] if rotation else [])
+    shape_lo = [sigma_bounds[0], sigma_bounds[0]] + ([t0 - np.pi / 2] if rotation else [])
+    shape_hi = [sigma_bounds[1], sigma_bounds[1]] + ([t0 + np.pi / 2] if rotation else [])
+
     p0: list[float] = []
     lo: list[float] = []
     hi: list[float] = []
     for x0, y0, amp in peaks:
-        if shared_sigma:
-            p0 += [x0, y0, amp]
-            lo += [0.0, 0.0, 0.0]
-            hi += [float(w), float(h), top * 2.0]
-        else:
-            p0 += [x0, y0, amp, sigma_p0, sigma_p0]
-            lo += [0.0, 0.0, 0.0, sigma_bounds[0], sigma_bounds[0]]
-            hi += [float(w), float(h), top * 2.0, sigma_bounds[1], sigma_bounds[1]]
+        p0 += [x0, y0, amp]
+        lo += [0.0, 0.0, 0.0]
+        hi += [float(w), float(h), top * 2.0]
+        if not shared_sigma:
+            p0 += shape_p0
+            lo += shape_lo
+            hi += shape_hi
 
     if shared_sigma:
-        p0 += [sigma_p0, sigma_p0, bg0]
-        lo += [sigma_bounds[0], sigma_bounds[0], 0.0]
-        hi += [sigma_bounds[1], sigma_bounds[1], top]
+        p0 += shape_p0 + [bg0]
+        lo += shape_lo + [0.0]
+        hi += shape_hi + [top]
     else:
         p0 += [bg0]
         lo += [0.0]
@@ -282,6 +346,7 @@ def fit_n_gaussians(
     n_components: int,
     *,
     shared_sigma: bool = True,
+    rotation: bool = False,
     sigma_p0: float = 2.0,
     sigma_bounds: tuple[float, float] = (0.5, 8.0),
     min_sep: float = 2.0,
@@ -312,7 +377,7 @@ def fit_n_gaussians(
     """
     img = np.asarray(img, dtype=np.float64)
     n_pix = img.size
-    k = (3 * n_components + 3) if shared_sigma else (5 * n_components + 1)
+    k = _n_params(n_components, shared_sigma, rotation)
 
     def _failed() -> dict:
         return {
@@ -335,14 +400,15 @@ def fit_n_gaussians(
     weights = 1.0 / np.sqrt(np.clip(img, 1.0, None))
 
     p0, lo, hi = _build_p0_bounds(
-        img, n_components, shared_sigma, sigma_p0, sigma_bounds, min_sep, threshold_rel
+        img, n_components, shared_sigma, sigma_p0, sigma_bounds, min_sep,
+        threshold_rel, rotation,
     )
 
     try:
         result = least_squares(
             residuals,
             p0,
-            args=(xx, yy, img, weights, n_components, shared_sigma),
+            args=(xx, yy, img, weights, n_components, shared_sigma, rotation),
             bounds=(lo, hi),
             method="trf",
             max_nfev=max_nfev,
@@ -352,7 +418,7 @@ def fit_n_gaussians(
     except Exception:
         return _failed()
 
-    params = _sort_by_amplitude(result.x, n_components, shared_sigma)
+    params = _sort_by_amplitude(result.x, n_components, shared_sigma, rotation)
     chi2_raw = float(np.sum(result.fun ** 2))
     # Gaussian log-likelihood with the noise scale profiled out. A perfect fit
     # sends this to -inf, which is harmless (it wins the comparison) but not
@@ -369,7 +435,8 @@ def fit_n_gaussians(
     }
 
 
-def _sort_by_amplitude(params: np.ndarray, n: int, shared_sigma: bool) -> np.ndarray:
+def _sort_by_amplitude(params: np.ndarray, n: int, shared_sigma: bool,
+                       rotation: bool = False) -> np.ndarray:
     """Reorder components brightest-first, keeping the tail (sigmas, bg) in place.
 
     A stable sort leaves equal amplitudes in their fitted order, so a two-component
@@ -378,7 +445,7 @@ def _sort_by_amplitude(params: np.ndarray, n: int, shared_sigma: bool) -> np.nda
     params = np.asarray(params, dtype=np.float64).copy()
     if n == 1:
         return params
-    stride = 3 if shared_sigma else 5
+    stride = 3 if shared_sigma else (3 + _shape_size(rotation))
     block = params[: stride * n].reshape(n, stride)
     order = np.argsort(-block[:, 2], kind="stable")
     params[: stride * n] = block[order].ravel()
@@ -395,6 +462,9 @@ def fit_spot(
     criterion: str = "bic",
     chi2_threshold: float = 1.5,
     shared_sigma: bool = True,
+    rotation: bool = False,
+    amp_frac: float = 0.25,
+    dip_frac: float = 0.05,
     min_counts: float = 0.0,
     sigma_p0: float = 2.0,
     sigma_bounds: tuple[float, float] = (0.5, 8.0),
@@ -428,6 +498,33 @@ def fit_spot(
         Per-component widths are worth trying when the residual of a shared fit
         shows one sub-peak systematically broader (a diffuse V-pit beside a sharp
         core) — decide that on real residuals, not per pixel.
+    amp_frac, dip_frac : float
+        Resolvability thresholds, applied after the fit to decide which
+        components count as distinct sub-peaks: a component must reach
+        ``amp_frac`` of the brightest amplitude, and the model must dip by
+        ``dip_frac`` of the shallower end between it and every component already
+        kept.  Physical choices, not statistical ones.
+
+        ``dip_frac`` is deliberately small because the dip is *exactly zero*
+        below the Sparrow limit — two equal Gaussians closer than 2 sigma sum to
+        a single-peaked profile, so any dip at all already means they are
+        separated.  Measured on the noiseless model, the dip runs:
+
+            separation      2.0σ   2.5σ   3.0σ   4.0σ
+            equal peaks     0.000  0.123  0.358  0.729
+            A2/A1 = 0.6     0.000  0.000  0.198  0.654
+            A2/A1 = 0.3     0.000  0.000  0.017  0.535
+
+        so 0.05 admits a genuine doublet just past the limit while still
+        rejecting everything below it.  Raising it to the Rayleigh criterion's
+        ~26% — which is stated for *equal* peaks — would demand nearly 3 sigma of
+        an equal pair and 4 sigma of a 3:1 one.
+
+        ``amp_frac`` catches what the dip test cannot: a faint component thrown
+        far into a tail does produce a dip, so only its amplitude gives it away.
+        On the reference data the third component sits at a median 10% of the
+        peak, which 0.25 rejects.  See the module docstring for why the count
+        cannot come from the selection criterion instead.
     min_counts : float
         Return the empty result when the raw ROI sums below this.
 
@@ -437,12 +534,16 @@ def fit_spot(
         x{1..n_max}, y{1..n_max}            component centres (px, crop frame)
         A{1..n_max}                          amplitudes
         sigma_x{1..n_max}, sigma_y{1..n_max} widths (repeated when shared)
+        theta{1..n_max}                      angles (deg), NaN unless rotation=True
         bg                                   flat background
-        n_components                         N selected (0 when the fit failed)
+        n_fitted                             Gaussians the fit used (0 on failure)
+        n_resolved                           of those, how many are distinct
+                                             sub-peaks — the physical count
         n_params, chi2, chi2_raw, aic, bic, success
-        separation, orientation              between the two brightest components
-        ratio                                A2 / (A1 + A2)
-        total_amplitude, centroid_x, centroid_y
+        separation, orientation              between the two resolved sub-peaks,
+                                             NaN when fewer than two are resolved
+        ratio                                A2 / (A1 + A2) of that same pair
+        total_amplitude, centroid_x, centroid_y   over every fitted component
     Columns above the selected N are NaN, which keeps a DataFrame built from
     mixed-N positions rectangular.
     """
@@ -471,6 +572,7 @@ def fit_spot(
 
     fit_kw = dict(
         shared_sigma=shared_sigma,
+        rotation=rotation,
         sigma_p0=sigma_p0,
         sigma_bounds=sigma_bounds,
         min_sep=min_sep,
@@ -506,7 +608,89 @@ def fit_spot(
     if not best["success"]:
         return _empty_result(n_max)
 
-    return _flatten(best, best_n, n_max, shared_sigma)
+    return _flatten(best, best_n, n_max, shared_sigma, rotation, amp_frac, dip_frac)
+
+
+# ── Resolvability ─────────────────────────────────────────────────────────────
+
+def _has_valley(
+    params: np.ndarray,
+    n: int,
+    shared_sigma: bool,
+    rotation: bool,
+    bg: float,
+    a: np.ndarray,
+    b: np.ndarray,
+    dip_frac: float,
+    n_samples: int = 33,
+) -> bool:
+    """Does the model dip between the two centres ``a`` and ``b``?
+
+    Walks the fitted model along the segment joining them and compares the lowest
+    point to the shallower end. The background is taken off first: a pedestal
+    lifts both the ends and the valley, and would otherwise make every dip look
+    shallow on a bright ROI.
+
+    The model is sampled rather than the data, so noise cannot dig a false valley
+    between two halves of a single lobe.
+    """
+    t  = np.linspace(0.0, 1.0, n_samples)
+    xs = a[0] + t * (b[0] - a[0])
+    ys = a[1] + t * (b[1] - a[1])
+    prof = n_gaussians_2d(params, xs, ys, n, shared_sigma, rotation) - bg
+
+    ends = min(float(prof[0]), float(prof[-1]))
+    if ends <= 0:
+        return False
+    return (ends - float(prof.min())) / ends >= dip_frac
+
+
+def _resolved_indices(
+    params: np.ndarray,
+    n: int,
+    shared_sigma: bool,
+    rotation: bool,
+    amp_frac: float,
+    dip_frac: float,
+) -> list[int]:
+    """Which fitted components stand as distinct sub-peaks.
+
+    Two tests, one for each way a component can be an artefact of the model
+    rather than a feature of the spot:
+
+    * **amplitude** — a component fainter than ``amp_frac`` of the brightest is
+      dropped. This is what a Gaussian recruited to paint a heavy tail looks
+      like: measured on the reference data, a third component sits at a median
+      10% of the peak, 2.4 widths out, with only 6% of them within one width.
+    * **valley** — a component with no dip between it and one already kept is
+      dropped. That is the other failure: two components describing one lobe
+      between them, which no amount of separation alone would catch.
+
+    The valley test also handles unequal amplitudes for free. A faint peak has to
+    lie further out than an equal one before it shows as a bump on the flank of
+    the bright one, and asking for a dip encodes that; a plain "separated by more
+    than k sigma" rule does not.
+
+    Components arrive sorted by descending amplitude, so index 0 is the brightest
+    and is always kept.
+    """
+    comp, _, _, _, bg = _unpack(params, n, shared_sigma, rotation)
+    if n < 2:
+        return [0]
+
+    amps = comp[:, 2]
+    if amps[0] <= 0:
+        return [0]
+
+    kept = [0]
+    for c in range(1, n):
+        if amps[c] < amp_frac * amps[0]:
+            continue
+        if all(_has_valley(params, n, shared_sigma, rotation, bg,
+                           comp[k], comp[c], dip_frac)
+               for k in kept):
+            kept.append(c)
+    return kept
 
 
 def _empty_result(n_max: int) -> dict:
@@ -517,9 +701,11 @@ def _empty_result(n_max: int) -> dict:
         out[f"A{k}"] = np.nan
         out[f"sigma_x{k}"] = np.nan
         out[f"sigma_y{k}"] = np.nan
+        out[f"theta{k}"] = np.nan
     out.update({
         "bg": np.nan,
-        "n_components": 0,
+        "n_fitted": 0,
+        "n_resolved": 0,
         "n_params": 0,
         "chi2": np.nan,
         "chi2_raw": np.nan,
@@ -536,8 +722,11 @@ def _empty_result(n_max: int) -> dict:
     return out
 
 
-def _flatten(res: dict, n: int, n_max: int, shared_sigma: bool) -> dict:
-    comp, sx, sy, bg = _unpack(res["params"], n, shared_sigma)
+def _flatten(res: dict, n: int, n_max: int, shared_sigma: bool,
+             rotation: bool = False, amp_frac: float = 0.25,
+             dip_frac: float = 0.05) -> dict:
+    params = res["params"]
+    comp, sx, sy, theta, bg = _unpack(params, n, shared_sigma, rotation)
 
     out = _empty_result(n_max)
     for k in range(n):
@@ -546,9 +735,12 @@ def _flatten(res: dict, n: int, n_max: int, shared_sigma: bool) -> dict:
         out[f"A{k + 1}"] = float(comp[k, 2])
         out[f"sigma_x{k + 1}"] = float(sx[k])
         out[f"sigma_y{k + 1}"] = float(sy[k])
+        # NaN rather than 0 when not rotating: the angle was never a parameter,
+        # and reporting it as measured-and-zero would be a different claim.
+        out[f"theta{k + 1}"] = float(np.degrees(theta[k])) if rotation else np.nan
 
     out["bg"] = bg
-    out["n_components"] = n
+    out["n_fitted"] = n
     out["n_params"] = int(res["n_params"])
     out["chi2"] = float(res["chi2"])
     out["chi2_raw"] = float(res["chi2_raw"])
@@ -563,42 +755,49 @@ def _flatten(res: dict, n: int, n_max: int, shared_sigma: bool) -> dict:
         out["centroid_x"] = float((amps * comp[:, 0]).sum() / total)
         out["centroid_y"] = float((amps * comp[:, 1]).sum() / total)
 
-    if n >= 2:
-        dx = float(comp[1, 0] - comp[0, 0])
-        dy = float(comp[1, 1] - comp[0, 1])
-        out["separation"] = float(math.hypot(dx, dy))
+    kept = _resolved_indices(params, n, shared_sigma, rotation, amp_frac, dip_frac)
+    out["n_resolved"] = len(kept)
+
+    # The pair quantities describe two *resolved* sub-peaks or nothing at all.
+    # Left unguarded they would report the distance to a tail-patching component,
+    # which is a property of the fit rather than of the spot — and on this data
+    # that is the majority of positions, so the maps would be mostly artefact.
+    if len(kept) >= 2:
+        p, q = comp[kept[0]], comp[kept[1]]
+        dx, dy = float(q[0] - p[0]), float(q[1] - p[1])
+        out["separation"]  = float(math.hypot(dx, dy))
         out["orientation"] = float(np.degrees(np.arctan2(dy, dx)))
-        a1, a2 = float(amps[0]), float(amps[1])
+        a1, a2 = float(p[2]), float(q[2])
         out["ratio"] = a2 / (a1 + a2 + 1e-9)
     return out
 
 
 # ── Reconstruction ────────────────────────────────────────────────────────────
 
-def model_from_result(result: dict, shape: tuple[int, int], shared_sigma: bool = True) -> np.ndarray:
+def model_from_result(result: dict, shape: tuple[int, int], shared_sigma: bool = True,
+                      rotation: bool = False) -> np.ndarray:
     """Rebuild the fitted image from a ``fit_spot`` result, for residual plots.
 
     Returns an all-NaN array when the fit failed, so a residual panel shows the
     failure rather than a misleading flat model.
     """
     h, w = shape
-    n = int(result.get("n_components", 0))
+    n = int(result.get("n_fitted", 0))
     if n < 1:
         return np.full(shape, np.nan)
 
+    def shape_block(k: int) -> list[float]:
+        block = [result[f"sigma_x{k}"], result[f"sigma_y{k}"]]
+        if rotation:
+            block.append(np.radians(result[f"theta{k}"]))
+        return block
+
     params: list[float] = []
     for k in range(1, n + 1):
-        if shared_sigma:
-            params += [result[f"x{k}"], result[f"y{k}"], result[f"A{k}"]]
-        else:
-            params += [
-                result[f"x{k}"], result[f"y{k}"], result[f"A{k}"],
-                result[f"sigma_x{k}"], result[f"sigma_y{k}"],
-            ]
-    if shared_sigma:
-        params += [result["sigma_x1"], result["sigma_y1"], result["bg"]]
-    else:
-        params += [result["bg"]]
+        params += [result[f"x{k}"], result[f"y{k}"], result[f"A{k}"]]
+        if not shared_sigma:
+            params += shape_block(k)
+    params += (shape_block(1) if shared_sigma else []) + [result["bg"]]
 
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
-    return n_gaussians_2d(np.asarray(params), xx, yy, n, shared_sigma)
+    return n_gaussians_2d(np.asarray(params), xx, yy, n, shared_sigma, rotation)

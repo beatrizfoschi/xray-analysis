@@ -39,6 +39,21 @@ class StubScan:
         return i * 1e-3, j * 1e-3
 
 
+SIGMA = 2.0
+
+
+def _separation(i: int) -> float:
+    """Sub-peak separation built into column ``i``, in pixels.
+
+    Starts at 3.5 sigma. The Sparrow limit — the separation below which two
+    Gaussians sum to a single-peaked profile, so `fit_spot` reports no separation
+    at all — is 2 sigma only for *equal* peaks; the 2:1 amplitude ratio used here
+    pushes it past 3, because the fainter peak has to climb out of the bright
+    one's flank before it reads as a second peak.
+    """
+    return 7.0 + 2.0 * i
+
+
 @pytest.fixture(scope="module")
 def stack_h5(tmp_path_factory):
     """A scan whose sub-peak separation grows along i, so maps can be checked."""
@@ -49,11 +64,11 @@ def stack_h5(tmp_path_factory):
     frames = np.empty((N_POS, FRAME, FRAME), dtype=np.float32)
     for j in range(NJ):
         for i in range(NI):
-            sep = 2.0 + 1.0 * i
+            sep = _separation(i)
             img = np.full((FRAME, FRAME), 80.0)
             for dx, amp in ((-sep / 2, 6000.0), (sep / 2, 3000.0)):
                 img += amp * np.exp(
-                    -((xx - (30 + dx)) ** 2 + (yy - 30) ** 2) / (2 * 2.0 ** 2)
+                    -((xx - (30 + dx)) ** 2 + (yy - 30) ** 2) / (2 * SIGMA ** 2)
                 )
             frames[j * NI + i] = rng.poisson(img)
 
@@ -137,14 +152,34 @@ def test_the_fit_recovers_the_separation_built_into_the_scan(stack_h5):
                            n_components=2, **_RUN_KW)
     got = df[df.status == "ok"].groupby("i")["separation"].median()
     for i in range(NI):
-        assert got[i] == pytest.approx(2.0 + 1.0 * i, abs=0.5)
+        assert got[i] == pytest.approx(_separation(i), abs=0.5)
+
+
+def test_an_unresolvable_pair_reports_no_separation(stack_h5):
+    """Below the Sparrow limit there is no dip, so there is nothing to report.
+
+    A separation of one sigma is not a doublet in the data, whatever the fit
+    chooses to put there — `fit_spot` withholds the pair quantities rather than
+    reporting the distance between two halves of one lobe.
+    """
+    import h5py
+
+    rng = np.random.default_rng(4)
+    yy, xx = np.mgrid[0:FRAME, 0:FRAME].astype(float)
+    img = np.full((FRAME, FRAME), 80.0)
+    for dx, amp in ((-SIGMA / 2, 6000.0), (SIGMA / 2, 3000.0)):
+        img += amp * np.exp(-((xx - (30 + dx)) ** 2 + (yy - 30) ** 2) / (2 * SIGMA ** 2))
+    res = fit_spot(rng.poisson(img)[20:41, 20:41].astype(float), n_components=2)
+    assert res["n_fitted"] == 2
+    assert res["n_resolved"] == 1
+    assert np.isnan(res["separation"])
 
 
 def test_spot_kwargs_reach_the_analysis_function(stack_h5):
     df = run_spot_pipeline(stack_h5, StubScan(), analysis_fn=fit_spot,
                            n_components="auto", n_max=2, executor="process",
                            **_RUN_KW)
-    assert df["n_components"].max() <= 2
+    assert df["n_fitted"].max() <= 2
 
 
 # ── Grid bookkeeping ──────────────────────────────────────────────────────────

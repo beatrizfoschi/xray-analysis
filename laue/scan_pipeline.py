@@ -715,11 +715,17 @@ _DEFAULT_METRICS = [
 # amplitude, so where two of them are nearly equally bright the labels can swap
 # between neighbouring positions and speckle the x1/x2 maps without anything
 # physical having changed.
+#
+# `n_resolved` is the sub-peak count; `n_fitted` is how many Gaussians the fit
+# needed, which is a fit-quality quantity and not a physical one (see
+# spot_fit's module docstring). Both are mapped because reading them together
+# is what tells a genuinely split spot from a streak the model had to tile.
 _FIT_METRICS = [
     ("separation",      "Sub-peak separation (px)",   "magma"),
     ("orientation",     "Separation angle (°)",       "twilight"),
     ("ratio",           "A₂ / (A₁ + A₂)",             "RdBu_r"),
-    ("n_components",    "N components",               "Reds"),
+    ("n_resolved",      "N resolved sub-peaks",       "Reds"),
+    ("n_fitted",        "N fitted Gaussians",         "Purples"),
     ("total_amplitude", "Total amplitude",            "viridis"),
     ("sigma_x1",        "Width σₓ (px)",              "cividis"),
     ("sigma_y1",        "Width σᵧ (px)",              "cividis"),
@@ -764,7 +770,7 @@ def plot_spot_maps(
     matplotlib Figure
     """
     if metrics is None:
-        metrics = _FIT_METRICS if "n_components" in df.columns else _DEFAULT_METRICS
+        metrics = _FIT_METRICS if "n_fitted" in df.columns else _DEFAULT_METRICS
     metrics = [m for m in metrics if m[0] in df.columns]
     if not metrics:
         raise ValueError("None of the requested metric columns are in the DataFrame.")

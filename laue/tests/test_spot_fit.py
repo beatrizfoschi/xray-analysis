@@ -214,12 +214,67 @@ def test_per_component_sigma_frees_the_widths():
     assert res["n_params"] == 11
 
 
+# ── Rotation ──────────────────────────────────────────────────────────────────
+
+def _tilted_streak(angle_deg=35.0, seed=11):
+    h, w = 20, 20
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    a = np.radians(angle_deg)
+    u = (xx - 10) * np.cos(a) + (yy - 10) * np.sin(a)
+    v = -(xx - 10) * np.sin(a) + (yy - 10) * np.cos(a)
+    img = 200.0 + 6000.0 * np.exp(-(u ** 2 / (2 * 6.0 ** 2) + v ** 2 / (2 * 1.5 ** 2)))
+    return np.random.default_rng(seed).poisson(img).astype(np.float64)
+
+
+def test_rotation_is_off_by_default():
+    """The default model is the axis-aligned one the earlier results came from."""
+    assert fit_spot(DOUBLET, n_components=2)["n_params"] == 9
+    assert np.isnan(fit_spot(DOUBLET, n_components=2)["theta1"])
+
+
+@pytest.mark.parametrize(
+    "n, shared, expected", [(1, True, 7), (2, True, 10), (2, False, 13)]
+)
+def test_rotation_adds_one_angle_per_shape_block(n, shared, expected):
+    res = fit_n_gaussians(DOUBLET, n, shared_sigma=shared, rotation=True)
+    assert res["n_params"] == expected
+
+
+def test_a_rotated_fit_recovers_the_tilt():
+    res = fit_spot(_tilted_streak(35.0), n_components=1, rotation=True)
+    assert res["success"]
+    # theta and theta+180 describe the same ellipse.
+    assert min(abs(res["theta1"] - 35.0), abs(abs(res["theta1"] - 35.0) - 180.0)) < 10.0
+
+
+def test_rotation_fits_a_tilted_streak_better_than_axis_aligned():
+    roi = _tilted_streak(35.0)
+    plain = fit_n_gaussians(roi, 1, rotation=False)["chi2"]
+    turned = fit_n_gaussians(roi, 1, rotation=True)["chi2"]
+    assert turned < plain
+
+
+def test_a_tilted_streak_needs_fewer_components_once_it_can_turn():
+    """One rotated Gaussian is a streak; axis-aligned ones have to tile it."""
+    roi = _tilted_streak(35.0)
+    plain = fit_spot(roi, n_components="auto", n_max=3, criterion="bic")
+    turned = fit_spot(roi, n_components="auto", n_max=3, criterion="bic", rotation=True)
+    assert turned["n_fitted"] < plain["n_fitted"]
+
+
+def test_model_from_result_honours_the_rotation():
+    res = fit_spot(_tilted_streak(35.0), n_components=1, rotation=True)
+    model = model_from_result(res, (20, 20), rotation=True)
+    flat = model_from_result(res, (20, 20), rotation=False)
+    assert not np.allclose(model, flat)
+
+
 # ── Model selection ───────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("criterion", ["bic", "aic"])
 def test_auto_picks_one_component_for_a_single_peak(criterion):
     res = fit_spot(SINGLE, n_components="auto", criterion=criterion)
-    assert res["n_components"] == 1
+    assert res["n_fitted"] == 1
     assert np.isnan(res["x2"])
     assert np.isnan(res["separation"])
 
@@ -227,24 +282,24 @@ def test_auto_picks_one_component_for_a_single_peak(criterion):
 @pytest.mark.parametrize("criterion", ["bic", "aic"])
 def test_auto_finds_the_second_component_of_a_doublet(criterion):
     res = fit_spot(DOUBLET, n_components="auto", criterion=criterion)
-    assert res["n_components"] == 2
+    assert res["n_fitted"] == 2
     assert res["separation"] == pytest.approx(6.0, abs=0.5)
 
 
 def test_bic_is_not_more_permissive_than_aic():
     """BIC penalises each parameter by ln(n_pixels), AIC by 2 — so BIC never grows N further."""
     for roi in (SINGLE, DOUBLET, TRIPLET):
-        n_bic = fit_spot(roi, n_components="auto", criterion="bic")["n_components"]
-        n_aic = fit_spot(roi, n_components="auto", criterion="aic")["n_components"]
+        n_bic = fit_spot(roi, n_components="auto", criterion="bic")["n_fitted"]
+        n_aic = fit_spot(roi, n_components="auto", criterion="aic")["n_fitted"]
         assert n_bic <= n_aic
 
 
 def test_chi2_criterion_stops_at_the_first_acceptable_fit():
     """A generous threshold is met by N=1 even on a doublet; a strict one is not."""
     loose = fit_spot(DOUBLET, n_components="auto", criterion="chi2", chi2_threshold=1e9)
-    assert loose["n_components"] == 1
+    assert loose["n_fitted"] == 1
     strict = fit_spot(DOUBLET, n_components="auto", criterion="chi2", chi2_threshold=1e-9)
-    assert strict["n_components"] >= 2
+    assert strict["n_fitted"] >= 2
 
 
 def test_selection_criteria_profile_the_noise_scale_out():
@@ -268,8 +323,8 @@ def test_criteria_are_invariant_to_rescaling_the_roi():
     A monitor normalisation is exactly such a rescaling, so the selected N must
     not depend on whether it was applied.
     """
-    n_plain = fit_spot(DOUBLET, n_components="auto", criterion="bic")["n_components"]
-    n_scaled = fit_spot(DOUBLET * 4.0, n_components="auto", criterion="bic")["n_components"]
+    n_plain = fit_spot(DOUBLET, n_components="auto", criterion="bic")["n_fitted"]
+    n_scaled = fit_spot(DOUBLET * 4.0, n_components="auto", criterion="bic")["n_fitted"]
     assert n_plain == n_scaled
 
 
@@ -311,14 +366,14 @@ def test_the_selected_n_survives_a_gain_change():
     """
     roi = _rotated_streak()
     for criterion in ("bic", "aic"):
-        plain = fit_spot(roi, n_components="auto", criterion=criterion)["n_components"]
-        scaled = fit_spot(roi * 1000.0, n_components="auto", criterion=criterion)["n_components"]
+        plain = fit_spot(roi, n_components="auto", criterion=criterion)["n_fitted"]
+        scaled = fit_spot(roi * 1000.0, n_components="auto", criterion=criterion)["n_fitted"]
         assert plain == scaled
 
 
 def test_n_max_caps_the_search():
     res = fit_spot(TRIPLET, n_components="auto", n_max=2, criterion="aic")
-    assert res["n_components"] <= 2
+    assert res["n_fitted"] <= 2
 
 
 def test_unknown_criterion_is_rejected():
@@ -329,6 +384,77 @@ def test_unknown_criterion_is_rejected():
 def test_n_components_outside_the_cap_is_rejected():
     with pytest.raises(ValueError, match="n_max"):
         fit_spot(DOUBLET, n_components=5, n_max=3)
+
+
+# ── Resolvability ─────────────────────────────────────────────────────────────
+
+def test_n_resolved_never_exceeds_n_fitted():
+    for roi in (SINGLE, DOUBLET, TRIPLET):
+        res = fit_spot(roi, n_components="auto", n_max=3)
+        assert 1 <= res["n_resolved"] <= res["n_fitted"]
+
+
+def test_a_real_doublet_resolves_into_two():
+    res = fit_spot(DOUBLET, n_components=2)
+    assert res["n_resolved"] == 2
+    assert res["separation"] == pytest.approx(6.0, abs=0.5)
+
+
+def test_a_faint_component_thrown_at_the_tail_is_not_a_sub_peak():
+    """The failure the count exists for: a Gaussian recruited to paint a wing.
+
+    Forcing two components onto a clean single spot puts the second one out in
+    the tail, faint. It lowers chi², so a selection criterion rewards it — but it
+    is a property of the model, not of the spot.
+    """
+    res = fit_spot(SINGLE, n_components=2)
+    assert res["n_fitted"] == 2
+    assert res["n_resolved"] == 1
+
+
+def test_two_components_inside_one_lobe_do_not_resolve():
+    """The other failure: both centres on the same hump, no valley between them.
+
+    A pair this close sums to a single-peaked profile — below the Sparrow limit —
+    so no separation threshold alone would catch it; only asking for the dip does.
+    """
+    blended = _make_roi([(9.5, 10.0, 5000.0), (10.5, 10.0, 4500.0)], seed=5)
+    res = fit_spot(blended, n_components=2)
+    assert res["n_resolved"] == 1
+
+
+def test_pair_quantities_are_withheld_when_nothing_is_resolved():
+    """separation/orientation/ratio describe two sub-peaks or say nothing."""
+    res = fit_spot(SINGLE, n_components=2)
+    assert res["n_resolved"] == 1
+    assert np.isnan(res["separation"])
+    assert np.isnan(res["orientation"])
+    assert np.isnan(res["ratio"])
+
+
+def test_the_amplitude_threshold_is_adjustable():
+    res_strict = fit_spot(DOUBLET, n_components=2, amp_frac=0.95)
+    res_loose = fit_spot(DOUBLET, n_components=2, amp_frac=0.01)
+    # The doublet is 5000 vs 3000, so a 95% floor rejects the fainter peak.
+    assert res_strict["n_resolved"] == 1
+    assert res_loose["n_resolved"] == 2
+
+
+def test_the_dip_threshold_is_adjustable():
+    demanding = fit_spot(DOUBLET, n_components=2, dip_frac=0.99)
+    permissive = fit_spot(DOUBLET, n_components=2, dip_frac=0.0)
+    assert demanding["n_resolved"] == 1
+    assert permissive["n_resolved"] == 2
+
+
+def test_separation_uses_the_resolved_pair_not_the_first_two():
+    """When component 2 is a tail-patcher and component 3 is real, use 1 and 3."""
+    from laue.spot_fit import _resolved_indices, fit_n_gaussians
+
+    res = fit_n_gaussians(TRIPLET, 3)
+    kept = _resolved_indices(res["params"], 3, True, False, 0.25, 0.20)
+    assert kept[0] == 0
+    assert kept == sorted(kept)
 
 
 # ── Output schema ─────────────────────────────────────────────────────────────
@@ -343,7 +469,7 @@ def test_schema_width_does_not_depend_on_the_selected_n():
 
 def test_columns_above_the_selected_n_are_nan():
     res = fit_spot(SINGLE, n_components=1, n_max=3)
-    assert res["n_components"] == 1
+    assert res["n_fitted"] == 1
     for k in (2, 3):
         assert np.isnan(res[f"x{k}"]) and np.isnan(res[f"A{k}"])
 
@@ -371,13 +497,13 @@ def test_derived_quantities_use_every_component():
 def test_degenerate_rois_return_the_empty_result_without_raising(roi):
     res = fit_spot(roi, n_components=2)
     assert res["success"] is False
-    assert res["n_components"] == 0
+    assert res["n_fitted"] == 0
     assert np.isnan(res["x1"])
 
 
 def test_min_counts_rejects_a_faint_roi():
     faint = np.full((20, 20), 1.0)
-    assert fit_spot(faint, n_components=1, min_counts=1e6)["n_components"] == 0
+    assert fit_spot(faint, n_components=1, min_counts=1e6)["n_fitted"] == 0
 
 
 def test_a_background_subtracted_roi_still_fits():
