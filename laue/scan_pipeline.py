@@ -50,11 +50,7 @@ plot_spot_maps(df_fit, scan)
 from __future__ import annotations
 
 import threading
-from concurrent.futures import (
-    ProcessPoolExecutor,
-    ThreadPoolExecutor,
-    as_completed,
-)
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -134,12 +130,22 @@ from laue._imaging import crop_roi as _crop_roi
 
 # ── Worker plumbing ───────────────────────────────────────────────────────────
 #
-# All of this lives at module level because a process pool pickles what it runs,
-# and a closure cannot be pickled. Windows compounds it: processes start by
-# spawning, so each worker re-imports this module rather than inheriting the
-# parent's memory, and anything it needs has to survive a round trip through
-# pickle. That is also why the scan object stays in the parent — positions are
-# resolved to plain (index, x, y) tuples before they are handed out.
+# All of this lives at module level because a worker pickles what it runs, and a
+# closure cannot be pickled. Nothing here may hold an open HDF5 handle or the
+# scan object either — positions are resolved to plain (index, x, y) tuples in
+# the parent before they are handed out.
+
+def _frame_number(path: Path) -> int:
+    """Sort key for per-frame files named ``..._<index>.h5``."""
+    return int(path.stem.split("_")[-1])
+
+
+def _list_frame_files(folder: Path) -> list[Path]:
+    files = sorted(Path(folder).glob("*.h5"), key=_frame_number)
+    if not files:
+        raise FileNotFoundError(f"No .h5 files found in {folder}")
+    return files
+
 
 class _RoiReader:
     """Reads one ROI per frame index, holding its HDF5 handle open.
@@ -148,34 +154,47 @@ class _RoiReader:
     so the handle is cached — but an h5py handle survives neither a pickle nor a
     fork, so the cache is deliberately dropped on serialisation and reopened on
     first use in whatever thread or process ends up doing the reading.
+
+    In direct mode the file list is rebuilt in the worker rather than shipped to
+    it. joblib pickles the reader once per batch, and a scan of twenty thousand
+    frames would otherwise send its whole list of paths along every time; the
+    glob is deterministic, so re-running it costs one directory listing per
+    worker and nothing per batch.
     """
 
-    def __init__(self, img_source, *, direct_mode, files, h5_img_key,
+    def __init__(self, img_source, *, direct_mode, h5_img_key,
                  direct_h5_key, squeeze, row_slice, col_slice, pad):
-        self.img_source    = img_source
+        self.img_source    = Path(img_source)
         self.direct_mode   = direct_mode
-        self.files         = files
         self.h5_img_key    = h5_img_key
         self.direct_h5_key = direct_h5_key
         self.squeeze       = squeeze
         self.row_slice     = row_slice
         self.col_slice     = col_slice
         self.pad           = pad          # (top, bottom, left, right) or None
-        self._local        = threading.local()
+        self._reset_transient()
+
+    def _reset_transient(self) -> None:
+        self._files: list[Path] | None = None
+        self._local  = threading.local()
         self._handles: list = []
-        self._lock         = threading.Lock()
+        self._lock   = threading.Lock()
+
+    @property
+    def files(self) -> list[Path]:
+        if self._files is None:
+            self._files = _list_frame_files(self.img_source)
+        return self._files
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
-        for key in ("_local", "_handles", "_lock"):
+        for key in ("_files", "_local", "_handles", "_lock"):
             state.pop(key, None)
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
-        self._local   = threading.local()
-        self._handles = []
-        self._lock    = threading.Lock()
+        self._reset_transient()
 
     def read(self, idx: int) -> np.ndarray:
         if self.direct_mode:
@@ -219,28 +238,9 @@ def _analyse_one(task, reader: _RoiReader, analysis_fn, spot_kwargs: dict) -> di
     }
 
 
-# Set once per worker process by the pool initialiser; unused by the thread path,
-# which passes the same three objects explicitly instead.
-_WORKER_CONTEXT: tuple | None = None
-
-
-def _init_worker(reader: _RoiReader, analysis_fn, spot_kwargs: dict) -> None:
-    global _WORKER_CONTEXT
-    _WORKER_CONTEXT = (reader, analysis_fn, spot_kwargs)
-
-
-def _analyse_one_pooled(task) -> dict:
-    return _analyse_one(task, *_WORKER_CONTEXT)
-
-
 def _analyse_array(task, analysis_fn, spot_kwargs: dict) -> tuple[int, dict]:
     k, roi = task
     return k, analysis_fn(roi, **spot_kwargs)
-
-
-def _analyse_array_pooled(task) -> tuple[int, dict]:
-    _, analysis_fn, spot_kwargs = _WORKER_CONTEXT
-    return _analyse_array(task, analysis_fn, spot_kwargs)
 
 
 def _use_processes(executor: str, analysis_fn) -> bool:
@@ -251,6 +251,35 @@ def _use_processes(executor: str, analysis_fn) -> bool:
     raise ValueError(
         f'executor must be "auto", "thread" or "process", got {executor!r}'
     )
+
+
+def _run_parallel(jobs, *, total: int, workers: int, use_processes: bool, desc: str):
+    """Run `jobs` and yield results as they finish, with a progress bar.
+
+    joblib rather than `concurrent.futures.ProcessPoolExecutor`, which hangs when
+    driven from a Jupyter kernel: on Linux the pool inherits the kernel by
+    forking, and forking a process that already holds threads — HDF5's, BLAS's,
+    the kernel's own — deadlocks the children before they run a single task. That
+    is what a run stuck at 0/N with the workers alive looks like. joblib's loky
+    backend starts workers cleanly instead of forking, which is the whole reason
+    it exists, and it also serialises through cloudpickle, so an ``analysis_fn``
+    defined in a notebook cell works where a pickled one would not.
+
+    ``generator_unordered`` is what keeps the bar honest: results are yielded as
+    each finishes rather than collected into a list at the end.
+    """
+    from joblib import Parallel
+
+    backend = "loky" if use_processes else "threading"
+    results = Parallel(
+        n_jobs=workers,
+        backend=backend,
+        return_as="generator_unordered",
+    )(jobs)
+    with tqdm(total=total, desc=desc, unit="roi") as pbar:
+        for item in results:
+            yield item
+            pbar.update(1)
 
 
 def _prepare_reader(
@@ -276,19 +305,13 @@ def _prepare_reader(
     cen_row = (y - 1) if coords == "xmas" else y
 
     if direct_mode:
-        files = sorted(
-            img_source.glob("*.h5"),
-            key=lambda p: int(p.stem.split("_")[-1])
-        )
-        if not files:
-            raise FileNotFoundError(f"No .h5 files found in {img_source}")
+        files = _list_frame_files(img_source)
         with h5py.File(files[0], "r") as h5f:
             src_shape = h5f[direct_h5_key].shape   # (1, H, W) or (H, W)
         squeeze = len(src_shape) == 3
         H, W    = src_shape[-2], src_shape[-1]
         print(f"Direct mode: {len(files)} files, detector {H}×{W}")
     else:
-        files   = None
         squeeze = False
         with h5py.File(img_source, "r") as h5f:
             _, H, W = h5f[h5_img_key].shape
@@ -306,7 +329,6 @@ def _prepare_reader(
     reader = _RoiReader(
         img_source,
         direct_mode=direct_mode,
-        files=files,
         h5_img_key=h5_img_key,
         direct_h5_key=direct_h5_key,
         squeeze=squeeze,
@@ -455,28 +477,19 @@ def analyse_stack(
     print(f"Analysing {len(stack)} ROIs  "
           f"[{workers} {'processes' if use_processes else 'threads'}]...")
 
-    tasks = [(k, np.asarray(stack[k], dtype=np.float64)) for k in range(len(stack))]
-    results: list[dict | None] = [None] * len(stack)
+    from joblib import delayed
 
-    if use_processes:
-        pool = ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_worker,
-            initargs=(None, analysis_fn, spot_kwargs),
+    results: list[dict | None] = [None] * len(stack)
+    jobs = (
+        delayed(_analyse_array)(
+            (k, np.asarray(stack[k], dtype=np.float64)), analysis_fn, spot_kwargs
         )
-        submit = lambda task: pool.submit(_analyse_array_pooled, task)
-    else:
-        pool = ThreadPoolExecutor(max_workers=workers)
-        submit = lambda task: pool.submit(
-            _analyse_array, task, analysis_fn, spot_kwargs
-        )
-    with pool:
-        futures = {submit(task) for task in tasks}
-        with tqdm(total=len(tasks), desc="Analysing ROIs", unit="roi") as pbar:
-            for future in as_completed(futures):
-                k, metrics = future.result()
-                results[k] = metrics
-                pbar.update(1)
+        for k in range(len(stack))
+    )
+    for k, metrics in _run_parallel(jobs, total=len(stack), workers=workers,
+                                    use_processes=use_processes,
+                                    desc="Analysing ROIs"):
+        results[k] = metrics
 
     df = pd.DataFrame(results)
     df.insert(0, "frame", np.arange(len(stack)))
@@ -551,26 +564,25 @@ def run_spot_pipeline(
         a time and never held together. Run `_imaging.align_stack` as a pre-pass
         instead; see its docstring for which metrics that actually affects.
 
-        With ``executor="process"`` the function is pickled, so it has to be
-        importable by name: a module-level function, not a lambda or a closure.
-        ``functools.partial`` over a module-level function is fine.
+        With ``executor="process"`` the function is serialised to the workers.
+        joblib's loky backend uses cloudpickle, so a function defined in a
+        notebook cell works as well as an imported one.
     executor : {"auto", "thread", "process"}
         Threads share the interpreter, so they overlap the HDF5 reads but not
         Python-level computation — everything holding the GIL still runs one at a
         time. That is the right trade for ``analyze_spot``, which is dominated by
         the reads. An iterative fit is not: ``fit_spot`` measured ~4 positions/s
-        against ~91 for ``analyze_spot`` through the same thread pool, and only
-        separate processes recover the cores.
+        against ~91 for ``analyze_spot`` through the same thread pool, and 3.5x
+        that once the work is in separate processes.
 
         ``"auto"`` picks threads for ``analyze_spot`` and processes for anything
         else. Override it when the guess is wrong — a cheap custom ``analysis_fn``
-        is better off in threads, where there is no pickling and no start-up cost.
+        is better off in threads, where there is no serialisation and no start-up
+        cost.
 
-        From a **script**, a process pool needs the call to sit behind
-        ``if __name__ == "__main__":``. Windows starts workers by spawning, and a
-        worker re-imports the module it was started from; without the guard it
-        re-runs the script and spawns again. Notebooks are unaffected — the
-        worker imports an empty ``__mp_main__``.
+        From a **script**, put the call behind ``if __name__ == "__main__":``;
+        workers re-import the module they were started from. Notebooks need no
+        such guard.
     **spot_kwargs
         Extra keyword arguments forwarded to ``analysis_fn``. With
         ``executor="process"`` these are pickled too, so keep them to plain data.
@@ -602,25 +614,17 @@ def run_spot_pipeline(
 
     rows = list(masked_rows)
     if active_tasks:
+        from joblib import delayed
+
         try:
-            if use_processes:
-                pool = ProcessPoolExecutor(
-                    max_workers=workers,
-                    initializer=_init_worker,
-                    initargs=(reader, analysis_fn, spot_kwargs),
-                )
-                submit = lambda task: pool.submit(_analyse_one_pooled, task)
-            else:
-                pool = ThreadPoolExecutor(max_workers=workers)
-                submit = lambda task: pool.submit(
-                    _analyse_one, task, reader, analysis_fn, spot_kwargs
-                )
-            with pool:
-                futures = {submit(task) for task in active_tasks}
-                with tqdm(total=n_active, desc="Analysing spots", unit="spot") as pbar:
-                    for future in as_completed(futures):
-                        rows.append(future.result())
-                        pbar.update(1)
+            jobs = (
+                delayed(_analyse_one)(task, reader, analysis_fn, spot_kwargs)
+                for task in active_tasks
+            )
+            rows.extend(_run_parallel(
+                jobs, total=n_active, workers=workers,
+                use_processes=use_processes, desc="Analysing spots",
+            ))
         finally:
             # Only the parent's own handles; each worker closes its own on exit.
             reader.close()

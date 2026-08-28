@@ -100,6 +100,22 @@ def test_unknown_executor_is_rejected(stack_h5):
         run_spot_pipeline(stack_h5, StubScan(), executor="fork", **_RUN_KW)
 
 
+def test_a_locally_defined_analysis_reaches_the_worker_processes(stack_h5):
+    """loky serialises through cloudpickle, so a closure survives the trip.
+
+    Standing in for the case that actually matters: an analysis function written
+    in a notebook cell, which plain pickle cannot send to a worker at all.
+    """
+    scale = 3.0
+
+    def total_counts(roi):
+        return {"total": float(roi.sum()) * scale}
+
+    df = run_spot_pipeline(stack_h5, StubScan(), analysis_fn=total_counts,
+                           executor="process", **_RUN_KW)
+    assert (df["total"] > 0).all()
+
+
 # ── The analysis_fn hook ──────────────────────────────────────────────────────
 
 def test_default_analysis_is_unchanged(stack_h5):
@@ -165,7 +181,7 @@ def test_reader_survives_a_pickle_round_trip(stack_h5):
     import pickle
 
     reader = _RoiReader(
-        stack_h5, direct_mode=False, files=None, h5_img_key="frames",
+        stack_h5, direct_mode=False, h5_img_key="frames",
         direct_h5_key="unused", squeeze=False,
         row_slice=slice(20, 41), col_slice=slice(20, 41), pad=None,
     )

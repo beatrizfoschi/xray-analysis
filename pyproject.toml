@@ -19,6 +19,10 @@ dependencies = [
   "matplotlib",
   "pandas",
   "h5py",
+  # joblib arrives with scikit-learn anyway, but scan_pipeline imports it
+  # directly: its loky backend is the only process pool that survives being
+  # driven from a Jupyter kernel (see _run_parallel).
+  "joblib",
   "scikit-image",
   "scikit-learn",
   "tqdm",
