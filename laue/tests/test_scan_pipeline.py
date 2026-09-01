@@ -10,13 +10,16 @@ that spawns rather than forks.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from laue.scan_pipeline import (
     _RoiReader,
     analyse_stack,
+    plot_spot_maps,
     read_roi_stack,
     run_spot_pipeline,
+    scan_grid_layout,
 )
 from laue.spot_fit import fit_spot
 from laue.spot_metrics import analyze_spot
@@ -299,3 +302,47 @@ def test_alignment_then_fit_is_the_intended_composition(stack_h5):
                        workers=2)
     assert len(df) == N_POS
     assert df["separation"].notna().any()
+
+
+# ── Grids over part of a scan ─────────────────────────────────────────────────
+#
+# Selecting rows — an NMF or XEOL abundance mask applied by subsetting the stack,
+# rather than `run_spot_pipeline`'s `mask=`, which keeps skipped positions as NaN
+# rows — leaves the surviving i/j sparse. A grid sized by how many distinct
+# indices appear cannot hold indices that skip values.
+
+def _sparse_frame():
+    rows = []
+    for i in (0, 1, 4, 7):          # 4 distinct values spanning 8 cells
+        for j in (2, 3, 9):         # 3 distinct values spanning 8 cells
+            rows.append({"i": i, "j": j, "theta": float(i + j),
+                         "x_um": float(i), "y_um": float(j),
+                         "n_fitted": 2, "n_resolved": 1, "separation": float(i)})
+    return pd.DataFrame(rows)
+
+
+def test_grid_layout_spans_the_index_range_not_the_count():
+    i_min, j_min, n_i, n_j = scan_grid_layout(_sparse_frame())
+    assert (i_min, j_min) == (0, 2)
+    assert (n_i, n_j) == (8, 8)      # not (4, 3)
+
+
+def test_grid_layout_is_exact_on_a_full_rectangle():
+    df = pd.DataFrame([{"i": i, "j": j} for i in range(3) for j in range(5)])
+    assert scan_grid_layout(df) == (0, 0, 3, 5)
+
+
+def test_maps_of_a_masked_subset_do_not_fall_off_the_grid():
+    """Regression: sizing by nunique() raised IndexError on the first gap."""
+    fig = plot_spot_maps(_sparse_frame(), StubScan(),
+                         metrics=[("separation", "separation", "magma")])
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def test_theta_gradient_survives_a_masked_subset():
+    from laue.scan_pipeline import compute_theta_gradient
+
+    out = compute_theta_gradient(_sparse_frame())
+    assert "theta_gradient" in out.columns
+    assert len(out) == 12

@@ -187,3 +187,81 @@ def test_a_mismatched_stack_is_refused(fitted):
     stack, df = fitted
     with pytest.raises(ValueError, match="same order"):
         interactive_fit_map(df, stack[:-1])
+
+
+# ── Grids over part of a scan ─────────────────────────────────────────────────
+
+def test_a_masked_subset_keeps_its_positions_on_the_right_cells():
+    """The mask case: rows present only where an abundance map selected them."""
+    rows = []
+    for i in (0, 3, 4, 9):
+        for j in (1, 6):
+            rows.append({"i": i, "j": j, "n_resolved": float(i + j),
+                         "x_um": float(i), "y_um": float(j)})
+    df = pd.DataFrame(rows)
+
+    grid, lookup, extent = metric_grid(df, "n_resolved")
+    assert grid.shape == (6, 10)          # ranges, not counts
+    assert np.isnan(grid).sum() == 60 - len(df)
+
+    for pos, row in df.iterrows():
+        gi, gj = int(row["i"]) - 0, int(row["j"]) - 1
+        assert lookup[gj, gi] == pos
+        assert grid[gj, gi] == row["n_resolved"]
+
+
+def test_cells_with_no_row_stay_empty():
+    df = pd.DataFrame([{"i": 0, "j": 0, "n_resolved": 2.0, "x_um": 0.0, "y_um": 0.0},
+                       {"i": 2, "j": 2, "n_resolved": 1.0, "x_um": 2.0, "y_um": 2.0}])
+    grid, lookup, _ = metric_grid(df, "n_resolved")
+    assert grid.shape == (3, 3)
+    assert (lookup == -1).sum() == 7
+    assert np.isnan(grid[1, 1])
+
+
+# ── Positions a mask left out ─────────────────────────────────────────────────
+#
+# `run_spot_pipeline(mask=...)` keeps skipped positions as rows of NaN so the
+# grid stays rectangular. Clicking one must say so, not raise: `or 0` does not
+# guard an int() against NaN, because NaN is truthy.
+
+_MASKED_ROW = {"i": 1, "j": 2, "status": "masked", "n_fitted": np.nan,
+               "n_resolved": np.nan, "chi2": np.nan, "bg": np.nan}
+
+
+def test_a_masked_position_draws_instead_of_raising():
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3)
+    draw_fit_panels(axes, np.zeros((20, 20)), dict(_MASKED_ROW))
+    assert "outside the mask" in axes[0].get_title()
+    plt.close(fig)
+
+
+def test_a_masked_position_summarises_instead_of_raising():
+    text = summarise(dict(_MASKED_ROW))
+    assert "outside the mask" in text
+    assert "peak" not in text
+
+
+def test_a_failed_fit_is_still_distinguished_from_a_masked_one():
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3)
+    draw_fit_panels(axes, np.zeros((20, 20)),
+                    {"i": 0, "j": 0, "status": "ok", "n_fitted": 0, "n_resolved": 0})
+    assert "no fit" in axes[0].get_title()
+    plt.close(fig)
+
+
+def test_a_map_holding_masked_rows_still_builds():
+    df = pd.DataFrame([
+        {"i": 0, "j": 0, "status": "ok", "n_resolved": 2.0, "x_um": 0.0, "y_um": 0.0},
+        {"i": 0, "j": 1, "status": "masked", "n_resolved": np.nan, "x_um": 0.0, "y_um": 1.0},
+        {"i": 1, "j": 0, "status": "ok", "n_resolved": 1.0, "x_um": 1.0, "y_um": 0.0},
+        {"i": 1, "j": 1, "status": "masked", "n_resolved": np.nan, "x_um": 1.0, "y_um": 1.0},
+    ])
+    grid, lookup, _ = metric_grid(df, "n_resolved")
+    assert grid.shape == (2, 2)
+    assert np.isnan(grid).sum() == 2
+    assert (lookup >= 0).all()          # every cell still has a row behind it

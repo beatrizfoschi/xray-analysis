@@ -636,6 +636,24 @@ def run_spot_pipeline(
 
 # ── Scan-level: streak angle gradient ────────────────────────────────────────
 
+def scan_grid_layout(df: pd.DataFrame) -> tuple[int, int, int, int]:
+    """Origin and size of the grid spanned by a result DataFrame.
+
+    Returns ``(i_min, j_min, n_i, n_j)`` sized by the *range* of the indices, not
+    by how many distinct ones appear. The distinction only shows up once a run
+    covers part of a scan — an NMF or XEOL mask applied by selecting rows, rather
+    than by `run_spot_pipeline`'s ``mask=``, which keeps the skipped positions as
+    NaN rows. There the surviving ``j`` might be {0, 2, 5, …}: three distinct
+    values spanning six cells, and a grid sized by the count cannot hold them.
+
+    Positions with no row stay NaN, which is what leaves the holes a mask is
+    supposed to leave.
+    """
+    i_min, i_max = int(df["i"].min()), int(df["i"].max())
+    j_min, j_max = int(df["j"].min()), int(df["j"].max())
+    return i_min, j_min, i_max - i_min + 1, j_max - j_min + 1
+
+
 def compute_theta_gradient(df: pd.DataFrame) -> pd.DataFrame:
     """Add a ``theta_gradient`` column: local rate of change of streak angle.
 
@@ -653,11 +671,9 @@ def compute_theta_gradient(df: pd.DataFrame) -> pd.DataFrame:
     DataFrame with an additional ``theta_gradient`` column (°/step).
     """
     df = df.copy()
-    i_vals = np.sort(df["i"].unique())
-    j_vals = np.sort(df["j"].unique())
-    i_min, j_min = int(i_vals.min()), int(j_vals.min())
+    i_min, j_min, n_i, n_j = scan_grid_layout(df)
 
-    grid = np.full((len(i_vals), len(j_vals)), np.nan)
+    grid = np.full((n_i, n_j), np.nan)
     idx_map: dict[tuple, tuple] = {}
     for _, row in df.iterrows():
         gi = int(row["i"] - i_min)
@@ -793,10 +809,9 @@ def plot_spot_maps(
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False,
                              constrained_layout=True)
 
-    i_min, j_min = df["i"].min(), df["j"].min()
-    nbx, nby     = df["i"].nunique(), df["j"].nunique()
-    grid_shape   = (nbx, nby)
-    extent       = [x_um.min(), x_um.max(), y_um.min(), y_um.max()]
+    i_min, j_min, n_i, n_j = scan_grid_layout(df)
+    grid_shape = (n_i, n_j)
+    extent     = [x_um.min(), x_um.max(), y_um.min(), y_um.max()]
 
     for idx, (col, title, cmap) in enumerate(metrics):
         ax = axes[idx // ncols, idx % ncols]

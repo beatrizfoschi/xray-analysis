@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from laue.scan_pipeline import scan_grid_layout
 from laue.spot_fit import model_from_result
 
 _INDEX_COLS = ("i", "j", "frame_idx", "x_um", "y_um", "status")
@@ -60,12 +61,10 @@ def metric_grid(
                 "puts in itself."
             )
 
-    i_vals = np.sort(df["i"].unique())
-    j_vals = np.sort(df["j"].unique())
-    i_min, j_min = int(i_vals.min()), int(j_vals.min())
+    i_min, j_min, n_i, n_j = scan_grid_layout(df)
 
-    grid = np.full((len(j_vals), len(i_vals)), np.nan)
-    lookup = np.full((len(j_vals), len(i_vals)), -1, dtype=int)
+    grid = np.full((n_j, n_i), np.nan)
+    lookup = np.full((n_j, n_i), -1, dtype=int)
     for row_pos, (_, row) in enumerate(df.iterrows()):
         gi = int(row["i"]) - i_min
         gj = int(row["j"]) - j_min
@@ -76,9 +75,27 @@ def metric_grid(
         x, y = np.sort(df["x_um"].unique()), np.sort(df["y_um"].unique())
         extent = (float(x.min()), float(x.max()), float(y.min()), float(y.max()))
     else:
-        extent = (i_min - 0.5, i_min + len(i_vals) - 0.5,
-                  j_min - 0.5, j_min + len(j_vals) - 0.5)
+        extent = (float(i_min), float(i_min + n_i - 1),
+                  float(j_min), float(j_min + n_j - 1))
     return grid, lookup, extent
+
+
+def _count(row: dict, key: str) -> int:
+    """A component count from a result row, as an int, 0 when there is none.
+
+    `run_spot_pipeline(mask=...)` keeps the positions it skipped as rows whose
+    metric columns are all NaN, so the map stays rectangular. Those rows reach
+    here whenever someone clicks one. ``or 0`` does not catch them: NaN is
+    truthy, so it passes straight through to ``int()`` and raises.
+    """
+    v = row.get(key, 0)
+    if v is None:
+        return 0
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0
+    return 0 if np.isnan(f) else int(f)
 
 
 def draw_fit_panels(
@@ -94,10 +111,13 @@ def draw_fit_panels(
         ax.clear()
         ax.axis("off")
 
-    n_fitted = int(row.get("n_fitted", 0) or 0)
+    n_fitted = _count(row, "n_fitted")
     if n_fitted < 1:
         axes[0].imshow(roi, cmap="viridis", origin="lower")
-        axes[0].set_title("no fit at this position", fontsize=9)
+        status = str(row.get("status", "") or "")
+        axes[0].set_title(
+            "outside the mask" if status == "masked" else "no fit at this position",
+            fontsize=9)
         return
 
     model = model_from_result(row, roi.shape, shared_sigma, rotation)
@@ -109,7 +129,7 @@ def draw_fit_panels(
     lim = float(np.nanmax(np.abs(diff))) or 1.0
     axes[2].imshow(diff, cmap="RdBu_r", vmin=-lim, vmax=lim, origin="lower")
 
-    n_res = int(row.get("n_resolved", 0) or 0)
+    n_res = _count(row, "n_resolved")
     for c in range(1, n_fitted + 1):
         style = (dict(marker="+", color="red") if c <= n_res
                  else dict(marker="x", color="0.6"))
@@ -132,8 +152,12 @@ def summarise(row: dict) -> str:
         except (TypeError, ValueError):
             return str(v)
 
-    n_fit = int(row.get("n_fitted", 0) or 0)
-    n_res = int(row.get("n_resolved", 0) or 0)
+    n_fit = _count(row, "n_fitted")
+    n_res = _count(row, "n_resolved")
+    if n_fit < 1:
+        status = str(row.get("status", "") or "")
+        why = "outside the mask" if status == "masked" else "no fit at this position"
+        return f"position  (i, j) = ({int(row['i'])}, {int(row['j'])})\n{why}"
     lines = [
         f"position  (i, j) = ({int(row['i'])}, {int(row['j'])})",
         f"fitted {n_fit} Gaussian(s), {n_res} resolved",
