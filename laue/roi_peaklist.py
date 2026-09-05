@@ -46,6 +46,8 @@ separate clone and is not installed in this environment.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import re
 from pathlib import Path
 
@@ -101,7 +103,12 @@ def load_ub_and_calibration(fit_path) -> dict:
     try:
         from lauexplore import FitFile
 
-        fit = FitFile(str(fit_path))
+        # FitFile prints a line for every header line it does not recognise.
+        # On a calibration-panel file that is hundreds of lines of noise before
+        # it fails anyway, so the attempt is made quietly and only the reason
+        # for the failure is reported.
+        with contextlib.redirect_stdout(io.StringIO()):
+            fit = FitFile(str(fit_path))
         framedim = fit.CCDdict["framedim"]
         return {
             "ub_matrix": np.asarray(fit.UB, dtype=float),
@@ -127,20 +134,26 @@ def _scan_fit_file(fit_path: Path) -> dict:
     if ub is None:
         raise ValueError(f"No '#UB matrix' block found in {fit_path}")
 
-    det = re.search(r"#DetectorParameters\s*\n#\[([^\]]+)\]", text)
+    det = re.search(r"#DetectorParameters\s*\n#(.+)", text)
     pix = re.search(r"#pixelsize\s*\n#([0-9.eE+-]+)", text)
-    dim = re.search(r"#Frame dimensions\s*\n#\[([^\]]+)\]", text)
+    dim = re.search(r"#Frame dimensions\s*\n#(.+)", text)
     if det is None or pix is None or dim is None:
         raise ValueError(
             f"{fit_path} has no complete CCD block "
             f"(#DetectorParameters / #pixelsize / #Frame dimensions)"
         )
 
-    calib = [float(v) for v in det.group(1).replace(",", " ").split()]
-    framedim = [float(v) for v in dim.group(1).replace(",", " ").split()]
+    calib = _floats(det.group(1))
+    framedim = _floats(dim.group(1))
+    if len(calib) != 5 or len(framedim) != 2:
+        raise ValueError(
+            f"{fit_path}: expected 5 detector parameters and 2 frame dimensions, "
+            f"read {len(calib)} and {len(framedim)} from\n"
+            f"  {det.group(1).strip()}\n  {dim.group(1).strip()}"
+        )
 
     element = re.search(r"#Element\s*\n#(.+)", text)
-    cell = re.search(r"#new lattice parameters\s*\n#\[([^\]]+)\]", text)
+    cell = re.search(r"#new lattice parameters\s*\n#(.+)", text)
 
     return {
         "ub_matrix": ub,
@@ -148,11 +161,26 @@ def _scan_fit_file(fit_path: Path) -> dict:
         "pixel_size": float(pix.group(1)),
         "frame_shape": (int(framedim[0]), int(framedim[1])),
         "element": element.group(1).strip() if element else None,
-        "lattice_parameters": (
-            np.array([float(v) for v in cell.group(1).split()]) if cell else None
-        ),
+        "lattice_parameters": np.array(_floats(cell.group(1))) if cell else None,
         "source": "regex",
     }
+
+
+def _floats(text: str) -> list[float]:
+    """Numbers on a line, tolerating the reprs LaueTools writes.
+
+    `DetectorCalibration.py` writes `#DetectorParameters` as a list of
+    ``np.float64(99.967)`` reprs and `#Frame dimensions` as a tuple in
+    parentheses rather than a list in brackets. Both defeat a `float()` per
+    whitespace-separated token, which is what `lauexplore`'s `FitFile` does —
+    it raises `ValueError` on the first one.
+
+    Stripping the constructor before scanning is not cosmetic: a bare number
+    scan over ``np.float64(99.967)`` reads the ``64`` of ``float64`` as a
+    value, silently shifting every parameter that follows.
+    """
+    cleaned = re.sub(r"np\.\w+\(", "(", text)
+    return [float(v) for v in re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", cleaned)]
 
 
 def _matrix_after(text: str, header_pattern: str) -> np.ndarray | None:
@@ -172,13 +200,23 @@ def _matrix_after(text: str, header_pattern: str) -> np.ndarray | None:
 def check_cell_consistency(calib: dict, material: str,
                            material_dictionary: dict | None = None,
                            tol: float = 5e-3) -> None:
-    """Warn when the simulation cell differs from the one in the `.fit`.
+    """Warn when the cell used to simulate is not the cell the `.fit` used.
 
     `Prepare_Grain` applies the B0 of *material* to the UB read from the file.
-    If the file was indexed with a different cell, every simulated position is
-    systematically displaced — a silent failure that looks like a calibration
-    error. Prints a warning rather than raising, because a deliberate change of
-    cell is a legitimate thing to do.
+    The UB in a `.fit` is defined as ``q = UB B0 G*`` with the B0 of the
+    **nominal** cell of its ``#Element`` — so that is what has to match. If the
+    file was indexed with a different cell, every simulated position is
+    systematically displaced: a silent failure that looks like a calibration
+    error.
+
+    The refined cell in ``#new lattice parameters`` is deliberately *not* the
+    thing compared. It differs from the nominal one by the strain, which is
+    already folded into UB; treating that difference as a mismatch would warn
+    loudest exactly when the sample is most strained and the positions are in
+    fact correct. It is printed as information.
+
+    Prints rather than raises, because a deliberate change of cell is a
+    legitimate thing to do.
     """
     from LaueTools.dict_LaueTools import dict_Materials
 
@@ -188,23 +226,42 @@ def check_cell_consistency(calib: dict, material: str,
         return
 
     sim_cell = np.asarray(mat_dict[material][1], dtype=float)
-    fit_cell = calib.get("lattice_parameters")
+    element = calib.get("element")
+    print(f"  simulating '{material}' with cell {np.round(sim_cell, 4)}")
 
-    print(f"  simulation cell '{material}': {np.round(sim_cell, 4)}")
-    if fit_cell is None:
-        print(f"  .fit records element={calib.get('element')!r} but no refined cell "
-              f"— cannot cross-check. Confirm by hand that it was indexed with "
-              f"this cell.")
-        return
-
-    fit_cell = np.asarray(fit_cell, dtype=float)
-    print(f"  .fit cell (element={calib.get('element')!r}):  {np.round(fit_cell, 4)}")
-    rel = np.abs(sim_cell[:3] - fit_cell[:3]) / fit_cell[:3]
-    if np.any(rel > tol):
-        print(f"  WARNING: lattice constants differ by up to {100 * rel.max():.2f}% "
-              f"— simulated positions will be systematically displaced.")
+    if element is None:
+        print("  the .fit records no #Element — confirm by hand that it was "
+              "indexed with this cell.")
+    elif element == material:
+        print(f"  .fit was indexed as {element!r} — same label, cells agree.")
+    elif element not in mat_dict:
+        print(f"  WARNING: the .fit was indexed as {element!r}, which is not in "
+              f"the material dictionary given, so its cell cannot be checked "
+              f"against {material!r}.")
     else:
-        print("  cells agree.")
+        fit_cell = np.asarray(mat_dict[element][1], dtype=float)
+        print(f"  .fit was indexed as {element!r} with cell {np.round(fit_cell, 4)}")
+        rel = np.abs(sim_cell[:3] - fit_cell[:3]) / fit_cell[:3]
+        if np.any(rel > tol):
+            print(f"  WARNING: lattice constants differ by up to "
+                  f"{100 * rel.max():.2f}% — simulated positions will be "
+                  f"systematically displaced.")
+        else:
+            print("  cells agree.")
+
+    refined = calib.get("lattice_parameters")
+    if refined is not None:
+        refined = np.asarray(refined, dtype=float)
+        print(f"  refined cell in the .fit: {np.round(refined, 4)}")
+        # Measured against the cell the file was *indexed* with, not against the
+        # simulation cell: when those two disagree the difference is a mismatch,
+        # not strain, and quoting it as strain would hide the mismatch.
+        if element in mat_dict:
+            nominal = np.asarray(mat_dict[element][1], dtype=float)
+            strain = 100 * (refined[:3] - nominal[:3]) / nominal[:3]
+            print(f"    ({', '.join(f'{s:+.2f}%' for s in strain)} on a, b, c vs the "
+                  f"nominal {element!r} cell — this is the strain, already "
+                  f"contained in UB; not a mismatch)")
 
 
 # ── Simulation ────────────────────────────────────────────────────────────────
