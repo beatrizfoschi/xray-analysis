@@ -24,7 +24,7 @@ from matplotlib.colors import LogNorm
 from matplotlib.patches import Rectangle
 
 from laue._imaging import extract_crop
-from laue.roi_peaklist import build_peaklist, measure_roi
+from laue.roi_peaklist import build_peaklist, exclusion_halves, measure_roi
 
 
 def _clim(img, valid=None, lo=1.0, hi=99.5):
@@ -69,7 +69,10 @@ def plot_background_comparison(image, background, valid_mask=None, *,
     fig.colorbar(im2, ax=axs[2], fraction=0.046)
 
     fig.tight_layout()
-    return fig
+    # A tuple, like every other function here. Returning a bare Figure makes
+    # Jupyter render it a second time when the call is a cell's last
+    # expression, since a Figure has a rich repr and a tuple does not.
+    return fig, axs
 
 
 # ── Whole-detector overview ───────────────────────────────────────────────────
@@ -105,10 +108,11 @@ def plot_overview(
     vmin, vmax = _clim(image, valid_mask, 1.0, 99.97)
     ax.imshow(image, cmap="Greys_r", vmin=vmin, vmax=vmax, interpolation="nearest")
 
-    if blacklist_xy is not None and len(blacklist_xy) and exclusion_half:
-        h = int(exclusion_half)
+    if blacklist_xy is not None and len(blacklist_xy) and exclusion_half is not None:
+        hx, hy = exclusion_halves(exclusion_half)
         for x, y in np.asarray(blacklist_xy)[:max_boxes]:
-            ax.add_patch(Rectangle((x - h - 0.5, y - h - 0.5), 2 * h + 1, 2 * h + 1,
+            ax.add_patch(Rectangle((x - hx - 0.5, y - hy - 0.5),
+                                   2 * hx + 1, 2 * hy + 1,
                                    fill=True, facecolor="red", alpha=0.18,
                                    edgecolor="red", linewidth=0.4))
 
@@ -267,7 +271,7 @@ def plot_com_vs_intensity(peaks, *, figsize=(12, 4)):
                  "a strong correlation means part of the shift is artefact",
                  fontsize=10)
     fig.tight_layout()
-    return fig
+    return fig, axs
 
 
 # ── Interactive panel ─────────────────────────────────────────────────────────

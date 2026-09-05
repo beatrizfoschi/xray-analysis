@@ -354,17 +354,36 @@ def detector_mask_from_stack(frames: np.ndarray) -> np.ndarray:
     return frames.max(axis=0) > 0
 
 
+def exclusion_halves(exclusion_half) -> tuple[int, int]:
+    """Normalise an exclusion size to ``(half_x, half_y)`` in pixels.
+
+    Accepts a scalar for a square zone, or a ``(half_x, half_y)`` pair. The
+    substrate reflections are streaked rather than round — an isotropic zone
+    wide enough to cover the long axis eats the neighbouring material spot,
+    while one sized for the short axis lets the streak leak into the ROI — so
+    the two half-widths are independent.
+
+    ``half_x`` is along columns and ``half_y`` along rows, matching the
+    ``(X, Y) = (col, row)`` convention used for positions throughout.
+    """
+    if np.isscalar(exclusion_half):
+        h = int(exclusion_half)
+        return h, h
+    hx, hy = exclusion_half
+    return int(hx), int(hy)
+
+
 def forbidden_mask(
     shape: tuple[int, int],
     blacklist_xy: np.ndarray,
-    exclusion_half: int,
+    exclusion_half,
     *,
     detector_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Valid-pixel mask with a square exclusion zone around each blacklisted spot.
+    """Valid-pixel mask with a rectangular exclusion zone around each blacklisted spot.
 
     Returns ``True`` for pixels that may be used. Substrate spots are blanked
-    over a ``(2 * exclusion_half + 1)²`` square, so that a material ROI
+    over a ``(2*half_x + 1) x (2*half_y + 1)`` rectangle, so that a material ROI
     overlapping one of them contributes none of those pixels to its centre of
     mass — the exclusion is at pixel level, not at peak level.
 
@@ -372,8 +391,13 @@ def forbidden_mask(
     ----------
     shape : (n_rows, n_cols) of the detector frame.
     blacklist_xy : (N, 2) simulated substrate positions as (X, Y) = (col, row).
-    exclusion_half : half-width of the forbidden square, pixels.
+    exclusion_half : half-widths of the forbidden rectangle in pixels, either a
+        scalar for a square or ``(half_x, half_y)``. See `exclusion_halves`.
     detector_mask : optional valid-pixel mask (gaps, dead pixels) to AND with.
+
+    .. note:: The rectangle is axis-aligned. Where the substrate streaks run at
+       an angle, ``half_x`` and ``half_y`` have to cover the streak's bounding
+       box, which removes more than the streak itself.
     """
     mask = np.ones(shape, dtype=bool)
 
@@ -381,10 +405,10 @@ def forbidden_mask(
     if blacklist_xy.size:
         cols = np.rint(blacklist_xy[:, 0]).astype(int)
         rows = np.rint(blacklist_xy[:, 1]).astype(int)
-        h = int(exclusion_half)
+        hx, hy = exclusion_halves(exclusion_half)
         for r, c in zip(rows, cols):
-            r0, r1 = max(r - h, 0), min(r + h + 1, shape[0])
-            c0, c1 = max(c - h, 0), min(c + h + 1, shape[1])
+            r0, r1 = max(r - hy, 0), min(r + hy + 1, shape[0])
+            c0, c1 = max(c - hx, 0), min(c + hx + 1, shape[1])
             if r0 < r1 and c0 < c1:
                 mask[r0:r1, c0:c1] = False
 
