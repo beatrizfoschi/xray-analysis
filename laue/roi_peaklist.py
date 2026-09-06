@@ -858,11 +858,31 @@ def estimate_sim_offset(
 ) -> tuple[float, float]:
     """Median (dX, dY) between predicted positions and the local COM.
 
-    Settles the 0-based / 1-based question empirically instead of by
-    assumption: LaueTools' own peak files follow the XMAS 1-based convention
-    while numpy indexing is 0-based, and a systematic one-pixel offset is
-    invisible in a full-detector plot but is large compared with the COM shifts
-    this module measures.
+    .. warning::
+       **This is not a coordinate convention, and it is not free of signal.**
+       It was written to settle the 0-based / 1-based question empirically.
+       Measured on real data, it does not answer that question, because the
+       thing it measures is dominated by something else.
+
+       On frame 2710 the simulation reproduces the `.fit`'s own ``Xtheo`` to
+       0.00 px and the `.fit`'s fitted peak positions to 0.02 px — so there is
+       no convention offset between the simulation and LaueTools' peaks. Yet
+       the COM sits at ``(-0.5, -1.6)`` px from those peaks for GaN and
+       ``(-0.9, +0.9)`` px for sapphire: **opposite signs in Y for the two
+       materials**. A convention offset would be identical for both. What this
+       measures is the displacement between a spot's centre of mass and its
+       peak, which exists because the spots are asymmetric, and which differs
+       by material because their shapes differ.
+
+       That displacement is the quantity this module exists to map. So
+       subtracting it removes signal, and re-estimating it **per frame** would
+       subtract each frame's own mean displacement and flatten exactly the
+       spatial variation being looked for.
+
+       Use it, if at all, as a constant: estimate it once on a reference frame
+       and hold it fixed across the whole map, which only chooses where the
+       zero of the displacement map sits. Never call it inside a per-frame
+       loop.
 
     Uses only the brightest, well-isolated, uncontaminated spots, and only
     those whose COM lands within *max_shift* of the prediction, so that spots
@@ -889,6 +909,10 @@ def estimate_sim_offset(
     print(f"estimate_sim_offset: {len(meas)} spots, median offset "
           f"dX={dx:+.2f} px, dY={dy:+.2f} px "
           f"(scatter {meas['dX'].std():.2f}, {meas['dY'].std():.2f})")
+    if np.hypot(dx, dy) > 0.5:
+        print("  NOTE: this is mostly centre-of-mass minus peak, not a coordinate "
+              "convention — it is signal. Fix it once on a reference frame and "
+              "reuse the constant; do not re-estimate per frame. See the docstring.")
     return dx, dy
 
 
