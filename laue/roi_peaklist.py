@@ -62,10 +62,15 @@ from laue.spot_metrics import inertia_tensor, streak_moments
 
 _FWHM_FACTOR = 2.0 * np.sqrt(2.0 * np.log(2.0))
 
+# LaueTools' own .dat column set, in its order. It is not negotiable: readers
+# take the intensity by *position*, not by name — `Compute_data2thetachi` uses
+# ``basic_colunms_idx = (0, 1, 3)`` and so reads column 3 as the amplitude — and
+# `Compute_data2thetachi` also takes the saturation flag from the last column.
+# A shorter file is read without complaint and silently mis-columned.
 DAT_COLUMNS = [
-    "peak_X", "peak_Y", "peak_I",
+    "peak_X", "peak_Y", "peak_Itot", "peak_Isub",
     "peak_fwaxmaj", "peak_fwaxmin", "peak_inclination",
-    "Xdev", "Ydev", "peak_bkg",
+    "Xdev", "Ydev", "peak_bkg", "Ipixmax",
 ]
 
 
@@ -921,18 +926,24 @@ def estimate_sim_offset(
 def to_lauetools_dat(peaks: pd.DataFrame, outpath, *, accepted_only: bool = True):
     """Write a LaueTools-compatible `.dat` peak file.
 
-    Columns, in LaueTools' order::
+    Columns, in LaueTools' order and with its names — see `DAT_COLUMNS` for why
+    the order and the count both matter::
 
-        peak_X peak_Y peak_I peak_fwaxmaj peak_fwaxmin peak_inclination
-        Xdev Ydev peak_bkg
+        peak_X peak_Y peak_Itot peak_Isub peak_fwaxmaj peak_fwaxmin
+        peak_inclination Xdev Ydev peak_bkg Ipixmax
 
     Filled from the COM measurement:
 
     * ``peak_X``, ``peak_Y`` — the centre of mass. **Not** a fitted centre; see
       the module header.
-    * ``peak_I`` — background-subtracted peak pixel value, matching the
-      convention of a peak-search `.dat`. Integrated intensity is kept in the
-      DataFrame as ``total_counts`` but is not written here.
+    * ``peak_Isub`` — background-subtracted peak value, matching the convention
+      of a peak-search `.dat`. **This is the column LaueTools reads as the
+      intensity**, and the one that decides which spots indexing probes first.
+      Integrated intensity is kept in the DataFrame as ``total_counts`` but is
+      not written here.
+    * ``peak_Itot``, ``Ipixmax`` — the peak with the pedestal added back, which
+      for a centre-of-mass measurement is the best available stand-in for the
+      raw maximum a peak search would have reported.
     * ``peak_fwaxmaj/min``, ``peak_inclination`` — from the inertia tensor, the
       equivalent Gaussian FWHM along the principal axes and their angle. These
       are moments of the actual intensity distribution, valid for a distorted
@@ -953,17 +964,22 @@ def to_lauetools_dat(peaks: pd.DataFrame, outpath, *, accepted_only: bool = True
     if not len(df):
         raise ValueError("No accepted peaks to write.")
 
+    isub = df["peak_value"].to_numpy()
+    itot = isub + df["bg_level"].to_numpy()
+
     out = pd.DataFrame({
         "peak_X": df["X"].to_numpy(),
         "peak_Y": df["Y"].to_numpy(),
-        "peak_I": df["peak_value"].to_numpy(),
+        "peak_Itot": itot,
+        "peak_Isub": isub,
         "peak_fwaxmaj": df["fwhm_maj"].to_numpy(),
         "peak_fwaxmin": df["fwhm_min"].to_numpy(),
         "peak_inclination": df["theta"].to_numpy(),
         "Xdev": np.zeros(len(df)),
         "Ydev": np.zeros(len(df)),
         "peak_bkg": df["bg_level"].to_numpy(),
-    }).sort_values("peak_I", ascending=False).reset_index(drop=True)
+        "Ipixmax": itot,
+    })[DAT_COLUMNS].sort_values("peak_Isub", ascending=False).reset_index(drop=True)
 
     out.to_csv(outpath, sep=" ", index=False)
     print(f"Wrote {len(out)} peaks to {outpath}")
