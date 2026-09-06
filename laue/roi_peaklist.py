@@ -477,6 +477,42 @@ def gaussian_background(image: np.ndarray, valid_mask: np.ndarray,
 
 # ── Core measurement ──────────────────────────────────────────────────────────
 
+def _lower_tail_sigma(values: np.ndarray, pedestal: float,
+                      bg_percentile: float) -> float:
+    """Noise sigma from the lower tail only, without the half-distribution bias.
+
+    Only pixels below the pedestal may be used: everything above it is where a
+    spot would be, and a spot in the estimate inflates the noise and hides
+    itself. But a MAD taken about the pedestal over that lower tail is *not*
+    sigma — it measures the spread of half a distribution and comes out about
+    0.65 sigma for Gaussian noise, which inflates every SNR by half again.
+    That is not a small bookkeeping error: with the default box, pure noise
+    then scores snr ~ 6, so a `min_snr` of 3 rejects nothing at all.
+
+    Two lower-tail quantiles fix it exactly. For Gaussian noise the gap between
+    the p-th and (p/4)-th percentiles is a known multiple of sigma, so dividing
+    by that multiple recovers sigma itself. Both quantiles stay below the
+    pedestal, so the estimator keeps the property that made the one-sided MAD
+    attractive in the first place.
+    """
+    from scipy.stats import norm
+
+    p_hi = float(np.clip(bg_percentile, 2.0, 90.0))
+    p_lo = p_hi / 4.0
+    span = float(norm.ppf(p_hi / 100.0) - norm.ppf(p_lo / 100.0))
+
+    q_lo = float(np.percentile(values, p_lo))
+    sigma = (pedestal - q_lo) / span if span > 0 else 0.0
+    if sigma > 0:
+        return sigma
+
+    # Degenerate tail (quantised counts, a nearly empty ROI): fall back to the
+    # one-sided MAD, biased but better than declaring the noise to be zero,
+    # which would disable both the threshold and min_snr.
+    low = values[values <= pedestal]
+    return float(1.4826 * np.median(np.abs(low - pedestal))) if low.size else 0.0
+
+
 def measure_roi(
     image: np.ndarray,
     valid_mask: np.ndarray,
@@ -557,6 +593,16 @@ def measure_roi(
     (``dX``, ``dY``, ``dR``), the shape moments, and the diagnostics needed to
     decide whether a COM displacement is physical.
     """
+    # Below this the pedestal is the single darkest pixel of the ROI, the noise
+    # estimate collapses to zero, and both the n-sigma cut and min_snr stop
+    # applying — silently, since an infinite SNR passes every test.
+    if bg_percentile < 1.0:
+        raise ValueError(
+            f"bg_percentile={bg_percentile} is too low to estimate the noise; "
+            f"the pedestal becomes the darkest pixel and both the n-sigma "
+            f"threshold and min_snr stop having any effect. Use >= 1."
+        )
+
     boxsize = int(boxsize)
     cx, cy = float(center_xy[0]), float(center_xy[1])
     centre_px = (int(round(cx)), int(round(cy)))
@@ -594,9 +640,7 @@ def measure_roi(
 
     valid_values = crop[vmask_crop].astype(np.float64)
     bg = float(np.percentile(valid_values, bg_percentile))
-    low = valid_values[valid_values <= bg]
-    # MAD -> sigma; robust against the spot itself leaking into the estimate.
-    bg_std = float(1.4826 * np.median(np.abs(low - bg))) if low.size else 0.0
+    bg_std = _lower_tail_sigma(valid_values, bg, bg_percentile)
     out["bg_level"], out["bg_std"] = bg, bg_std
 
     sig = crop.astype(np.float64) - bg
@@ -685,6 +729,82 @@ def build_peaklist(
                         "d_nearest", "n_neighbours", "contaminated")
             if c in sim.columns]
     return pd.concat([sim[keep].reset_index(drop=True), meas], axis=1)
+
+
+# ── Confirming the substrate prediction against the image ─────────────────────
+
+def confirm_substrate_spots(
+    image: np.ndarray,
+    sim: pd.DataFrame,
+    valid_mask: np.ndarray,
+    *,
+    boxsize: int = 8,
+    min_snr: float = 5.0,
+    max_shift: float = 3.0,
+    **measure_kwargs,
+) -> pd.DataFrame:
+    """Mark which predicted substrate positions actually carry a spot.
+
+    The substrate simulation is a *mask generator*, not a physical model, and
+    its two errors do not cost the same. A predicted spot that is not there
+    costs one small excluded region. A real spot that was not predicted drags a
+    material centre of mass with nothing to show for it. The asymmetry argues
+    for predicting generously.
+
+    Generously means, in particular, past the experiment's own energy range: a
+    thick perfect substrate diffracts strongly enough to appear in the weak
+    high-energy tail of a white beam, at energies where a thin epilayer
+    produces nothing measurable. The substrate's ``Emax`` is not the material's
+    ``Emax``.
+
+    Predicting generously *without* checking is the opposite failure. Taking
+    sapphire from 29 to 50 keV grows the prediction from 233 to 1167 positions,
+    and the forbidden zones built from all of them reject a third of the
+    material spots — while most of those extra positions have no spot under
+    them at all. So each candidate is measured, and only the ones carrying
+    signal are kept.
+
+    Parameters
+    ----------
+    image : frame to check against, background-subtracted.
+    sim : predicted substrate positions, with ``X`` and ``Y`` columns.
+    valid_mask : gaps and dead pixels. Deliberately *not* the forbidden mask —
+        the forbidden zones are what this function is being used to build.
+    boxsize : half-width of the check box. Small, so a neighbouring material
+        spot is less likely to be counted as a confirmation.
+    min_snr : peak over noise required to call a position occupied.
+    max_shift : how far the local centre of mass may sit from the prediction
+        and still be considered the same spot. Guards against confirming a
+        candidate on the strength of a different reflection nearby.
+
+    Returns
+    -------
+    A copy of *sim* with ``confirmed`` (bool) plus the ``snr``, ``dR`` and
+    ``total_counts`` behind the decision, so a rejected candidate can be
+    inspected rather than merely disappearing.
+    """
+    rows = [
+        measure_roi(image, valid_mask, (r.X, r.Y), boxsize,
+                    min_snr=0.0, min_counts=0.0, max_edge_weight_frac=0.0,
+                    **measure_kwargs)
+        for r in sim.itertuples(index=False)
+    ]
+    meas = pd.DataFrame(rows)
+
+    out = sim.copy().reset_index(drop=True)
+    out["snr"] = meas["snr"].to_numpy()
+    out["total_counts"] = meas["total_counts"].to_numpy()
+    out["dR"] = meas["dR"].to_numpy()
+    out["confirmed"] = (
+        (meas["snr"].to_numpy() >= min_snr)
+        & (meas["dR"].to_numpy() <= max_shift)
+        & np.isfinite(meas["dR"].to_numpy())
+    )
+
+    n = int(out["confirmed"].sum())
+    print(f"confirm_substrate_spots: {n} of {len(out)} predicted positions carry a "
+          f"spot (snr >= {min_snr}, within {max_shift} px)")
+    return out
 
 
 # ── Simulated-vs-measured offset (coordinate convention check) ────────────────
