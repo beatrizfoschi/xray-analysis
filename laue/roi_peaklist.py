@@ -488,6 +488,7 @@ def measure_roi(
     min_counts: float = 50.0,
     min_snr: float = 3.0,
     min_valid_frac: float = 0.35,
+    max_edge_weight_frac: float = 0.02,
 ) -> dict:
     """Centre of mass and shape moments of one ROI, excluding masked pixels.
 
@@ -525,6 +526,30 @@ def measure_roi(
     min_counts, min_snr, min_valid_frac : acceptance thresholds. A ROI failing
         any of them is returned with ``accepted=False`` — never dropped
         silently, so the reason stays visible.
+    max_edge_weight_frac : reject when more than this fraction of the
+        thresholded signal sits on pixels touching the mask. See "Truncation"
+        below. 0 disables the test.
+
+    Truncation by the mask
+    ----------------------
+    A ROI overlapping a forbidden zone is not automatically bad: an exclusion
+    square clipping an empty corner costs nothing. What is fatal is the mask
+    reaching into the *spot*, because the COM is then the centre of whatever
+    survived the cut rather than of the spot, and it moves as the cut moves.
+
+    ``min_valid_frac`` cannot express that — it measures the box, and the box
+    is not the spot. The same 34% of a 31x31 box is harmless in a corner and
+    fatal through the core. So two spot-relative tests are applied instead:
+
+    * the predicted position itself landing on a masked pixel, which means the
+      ROI is centred inside the forbidden zone;
+    * ``edge_weight_frac``, the share of the thresholded signal sitting on
+      valid pixels that touch a masked one. A spot that stops well short of the
+      mask contributes nothing to it; a spot cut through carries much of its
+      weight right against the cut.
+
+    Both cover detector gaps as well as substrate zones — a spot sliced by a
+    module gap is untrustworthy for exactly the same reason.
 
     Returns
     -------
@@ -552,8 +577,16 @@ def measure_roi(
         "lambda1": np.nan, "lambda2": np.nan, "aspect_ratio": np.nan,
         "theta": np.nan, "fwhm_maj": np.nan, "fwhm_min": np.nan,
         "skewness": np.nan, "kurtosis": np.nan,
+        "centre_masked": False, "edge_weight_frac": np.nan, "d_mask": np.inf,
         "accepted": False, "reject_reason": "",
     }
+
+    # The predicted position itself falling on a masked pixel means the ROI is
+    # centred inside a forbidden zone. Recorded now, judged at the end, so the
+    # measurement that led to the rejection stays visible.
+    ry, rx = centre_px[1] - row0, centre_px[0] - col0
+    if 0 <= ry < vmask_crop.shape[0] and 0 <= rx < vmask_crop.shape[1]:
+        out["centre_masked"] = not bool(vmask_crop[ry, rx])
 
     if out["valid_frac"] < min_valid_frac:
         out["reject_reason"] = "too few valid pixels"
@@ -601,7 +634,21 @@ def measure_roi(
     skew, kurt = streak_moments(sig, x_com, y_com, theta)
     out["skewness"], out["kurtosis"] = float(skew), float(kurt)
 
-    if total < min_counts:
+    # How much of the spot is leaning on the mask, and how far the mask is from
+    # the centre of mass. Both are 0 / inf when the ROI holds no masked pixel.
+    if not vmask_crop.all():
+        touching = ndi.binary_dilation(~vmask_crop, np.ones((3, 3), bool)) & vmask_crop
+        out["edge_weight_frac"] = float(sig[touching].sum() / total)
+        dist = ndi.distance_transform_edt(vmask_crop)
+        out["d_mask"] = float(dist[int(round(y_com)), int(round(x_com))])
+    else:
+        out["edge_weight_frac"] = 0.0
+
+    if out["centre_masked"]:
+        out["reject_reason"] = "prediction inside forbidden zone"
+    elif max_edge_weight_frac > 0 and out["edge_weight_frac"] > max_edge_weight_frac:
+        out["reject_reason"] = "spot truncated by mask"
+    elif total < min_counts:
         out["reject_reason"] = "below min_counts"
     elif out["snr"] < min_snr:
         out["reject_reason"] = "below min_snr"

@@ -212,11 +212,12 @@ def plot_com_vs_boxsize(image, valid_mask, center_xy, *, boxsizes=range(5, 41, 2
     depend on the box rather than on the sample.
     """
     boxsizes = list(boxsizes)
-    dx, dy = [], []
+    dx, dy, rejected = [], [], []
     for b in boxsizes:
         m = measure_roi(image, valid_mask, center_xy, b, **measure_kwargs)
         dx.append(m["dX"])
         dy.append(m["dY"])
+        rejected.append(not m["accepted"])
 
     if ax is None:
         fig, ax = plt.subplots(figsize=figsize)
@@ -225,13 +226,25 @@ def plot_com_vs_boxsize(image, valid_mask, center_xy, *, boxsizes=range(5, 41, 2
 
     ax.plot(boxsizes, dx, "o-", label="dX")
     ax.plot(boxsizes, dy, "s-", label="dY")
+
+    # A growing box eventually swallows a detector gap or an exclusion zone,
+    # and past that point the curve is the COM of a truncated spot. It is still
+    # drawn — the shape is informative — but never unmarked, or a plateau read
+    # off this plot could be one the pipeline would refuse to measure.
+    rej = np.asarray(rejected)
+    if rej.any():
+        b = np.asarray(boxsizes)
+        ax.plot(b[rej], np.asarray(dx)[rej], "x", color="crimson", ms=8, mew=1.5)
+        ax.plot(b[rej], np.asarray(dy)[rej], "x", color="crimson", ms=8, mew=1.5,
+                label="rejected by measure_roi")
+
     ax.axhline(0, color="0.7", lw=0.8)
     ax.set_xlabel("boxsize (px)")
     ax.set_ylabel("COM − prediction (px)")
     ax.set_title(f"COM convergence at ({center_xy[0]:.0f}, {center_xy[1]:.0f})\n"
                  "flat = trustworthy; drifting = residual background",
                  fontsize=9)
-    ax.legend()
+    ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
     return fig, ax
