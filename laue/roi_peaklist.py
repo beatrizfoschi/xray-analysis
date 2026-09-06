@@ -740,7 +740,8 @@ def confirm_substrate_spots(
     *,
     boxsize: int = 8,
     min_snr: float = 5.0,
-    max_shift: float = 3.0,
+    max_shift: float = 6.0,
+    material_xy: np.ndarray | None = None,
     **measure_kwargs,
 ) -> pd.DataFrame:
     """Mark which predicted substrate positions actually carry a spot.
@@ -774,14 +775,34 @@ def confirm_substrate_spots(
         spot is less likely to be counted as a confirmation.
     min_snr : peak over noise required to call a position occupied.
     max_shift : how far the local centre of mass may sit from the prediction
-        and still be considered the same spot. Guards against confirming a
-        candidate on the strength of a different reflection nearby.
+        and still be considered the same spot.
+    material_xy : (N, 2) predicted positions of the *material*, if known.
+        Strongly recommended — see below.
+
+    Why the material positions matter
+    ---------------------------------
+    A candidate sitting a few pixels from a bright material reflection is
+    confirmed by that reflection's own intensity, and the forbidden zone then
+    lands on the material spot and destroys it. Tightening ``max_shift`` until
+    that stops also stops real substrate spots being found, and the two cannot
+    be separated by distance alone. Measured on one frame, sapphire coverage
+    against material yield::
+
+        max_shift=3, no material_xy    260 zones   103/165 covered   157 kept
+        max_shift=6, no material_xy    362 zones   164/165 covered   130 kept
+        max_shift=6, with material_xy  337 zones   164/165 covered   154 kept
+
+    With the positions supplied, a candidate is rejected when the intensity
+    confirming it is nearer to a material reflection than to the candidate
+    itself — the signal is spoken for. That buys back the coverage without
+    paying for it in material spots, so ``max_shift`` can be loose enough to
+    absorb the residual error in the substrate prediction.
 
     Returns
     -------
-    A copy of *sim* with ``confirmed`` (bool) plus the ``snr``, ``dR`` and
-    ``total_counts`` behind the decision, so a rejected candidate can be
-    inspected rather than merely disappearing.
+    A copy of *sim* with ``confirmed`` (bool) plus the ``snr``, ``dR``,
+    ``total_counts`` and ``d_material`` behind the decision, so a rejected
+    candidate can be inspected rather than merely disappearing.
     """
     rows = [
         measure_roi(image, valid_mask, (r.X, r.Y), boxsize,
@@ -795,15 +816,32 @@ def confirm_substrate_spots(
     out["snr"] = meas["snr"].to_numpy()
     out["total_counts"] = meas["total_counts"].to_numpy()
     out["dR"] = meas["dR"].to_numpy()
-    out["confirmed"] = (
-        (meas["snr"].to_numpy() >= min_snr)
-        & (meas["dR"].to_numpy() <= max_shift)
-        & np.isfinite(meas["dR"].to_numpy())
-    )
+
+    dR = meas["dR"].to_numpy()
+    has_spot = (meas["snr"].to_numpy() >= min_snr) & (dR <= max_shift) & np.isfinite(dR)
+
+    # Which candidates were confirmed by intensity that belongs to the material.
+    out["d_material"] = np.inf
+    if material_xy is not None and len(material_xy):
+        com = np.column_stack([meas["X"].to_numpy(), meas["Y"].to_numpy()])
+        ok = np.isfinite(com).all(axis=1)
+        d_mat = np.full(len(out), np.inf)
+        if ok.any():
+            d_mat[ok] = cKDTree(np.asarray(material_xy, float)).query(com[ok])[0]
+        out["d_material"] = d_mat
+        claimed = d_mat < dR
+    else:
+        claimed = np.zeros(len(out), bool)
+
+    out["confirmed"] = has_spot & ~claimed
 
     n = int(out["confirmed"].sum())
+    note = (f", {int((has_spot & claimed).sum())} dropped as material reflections"
+            if material_xy is not None and len(material_xy) else
+            "  [no material_xy given: candidates next to a material spot will be "
+            "confirmed by it]")
     print(f"confirm_substrate_spots: {n} of {len(out)} predicted positions carry a "
-          f"spot (snr >= {min_snr}, within {max_shift} px)")
+          f"spot (snr >= {min_snr}, within {max_shift} px){note}")
     return out
 
 
