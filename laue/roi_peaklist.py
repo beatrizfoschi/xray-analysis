@@ -202,6 +202,37 @@ def _matrix_after(text: str, header_pattern: str) -> np.ndarray | None:
     return np.array(rows)
 
 
+def _has_material(mat_dict, key: str) -> bool:
+    """``key in mat_dict``, surviving LaueTools' own ``Materials`` object.
+
+    Recent LaueTools ships ``dict_Materials`` as a class whose ``__contains__``
+    is a bare ``raise NotImplementedError``, so a plain ``in`` test explodes on
+    the object the caller is most likely to reach for. It does expose an
+    equivalent ``.contains()``.
+    """
+    contains = getattr(mat_dict, "contains", None)
+    if callable(contains) and not isinstance(mat_dict, dict):
+        return bool(contains(key))
+    try:
+        return key in mat_dict
+    except NotImplementedError:
+        return key in list(mat_dict.keys())
+
+
+def _cell_of(entry) -> np.ndarray:
+    """Lattice constants from a material-dictionary entry, either encoding.
+
+    LaueTools has shipped ``dict_Materials`` in two shapes: the older
+    ``[label, [a, b, c, alpha, beta, gamma], extinction]`` list, and the newer
+    ``{'label': ..., 'lattice': [...], 'extinction': ...}`` dict. Indexing with
+    ``[1]`` works on the first and raises ``KeyError: 1`` on the second, so the
+    caller would fail on exactly the LaueTools versions that are otherwise fine.
+    """
+    if isinstance(entry, dict):
+        return np.asarray(entry["lattice"], dtype=float)
+    return np.asarray(entry[1], dtype=float)
+
+
 def check_cell_consistency(calib: dict, material: str,
                            material_dictionary: dict | None = None,
                            tol: float = 5e-3) -> None:
@@ -226,11 +257,11 @@ def check_cell_consistency(calib: dict, material: str,
     from LaueTools.dict_LaueTools import dict_Materials
 
     mat_dict = material_dictionary if material_dictionary is not None else dict_Materials
-    if material not in mat_dict:
+    if not _has_material(mat_dict, material):
         print(f"WARNING: '{material}' is not in the material dictionary given.")
         return
 
-    sim_cell = np.asarray(mat_dict[material][1], dtype=float)
+    sim_cell = _cell_of(mat_dict[material])
     element = calib.get("element")
     print(f"  simulating '{material}' with cell {np.round(sim_cell, 4)}")
 
@@ -239,12 +270,12 @@ def check_cell_consistency(calib: dict, material: str,
               "indexed with this cell.")
     elif element == material:
         print(f"  .fit was indexed as {element!r} — same label, cells agree.")
-    elif element not in mat_dict:
+    elif not _has_material(mat_dict, element):
         print(f"  WARNING: the .fit was indexed as {element!r}, which is not in "
               f"the material dictionary given, so its cell cannot be checked "
               f"against {material!r}.")
     else:
-        fit_cell = np.asarray(mat_dict[element][1], dtype=float)
+        fit_cell = _cell_of(mat_dict[element])
         print(f"  .fit was indexed as {element!r} with cell {np.round(fit_cell, 4)}")
         rel = np.abs(sim_cell[:3] - fit_cell[:3]) / fit_cell[:3]
         if np.any(rel > tol):
@@ -261,8 +292,8 @@ def check_cell_consistency(calib: dict, material: str,
         # Measured against the cell the file was *indexed* with, not against the
         # simulation cell: when those two disagree the difference is a mismatch,
         # not strain, and quoting it as strain would hide the mismatch.
-        if element in mat_dict:
-            nominal = np.asarray(mat_dict[element][1], dtype=float)
+        if _has_material(mat_dict, element):
+            nominal = _cell_of(mat_dict[element])
             strain = 100 * (refined[:3] - nominal[:3]) / nominal[:3]
             print(f"    ({', '.join(f'{s:+.2f}%' for s in strain)} on a, b, c vs the "
                   f"nominal {element!r} cell — this is the strain, already "
@@ -527,6 +558,7 @@ def measure_roi(
     bg_percentile: float = 20.0,
     noise_nsigma: float = 1.5,
     min_counts: float = 50.0,
+    min_peak_value: float = 0.0,
     min_snr: float = 3.0,
     min_valid_frac: float = 0.35,
     max_edge_weight_frac: float = 0.02,
@@ -567,6 +599,23 @@ def measure_roi(
     min_counts, min_snr, min_valid_frac : acceptance thresholds. A ROI failing
         any of them is returned with ``accepted=False`` — never dropped
         silently, so the reason stays visible.
+
+        ``min_counts`` is far weaker than it looks and is best left at 0.
+        ``total_counts`` sums the thresholded signal over the *whole box*, and
+        the noise that survives the ``noise_nsigma`` cut is summed with it: on
+        a 27x27 ROI of pure noise it already reaches ~1960 counts at a noise
+        sigma of 5, so a threshold of 50 rejects nothing. Worse, the noise
+        contribution scales with the box area and with the local noise level,
+        so no fixed value is meaningful across a frame, let alone a map.
+    min_peak_value : reject when the brightest pixel, measured above the local
+        pedestal, is below this many counts. 0 disables it.
+
+        This is the threshold for "too faint", and it is not the same test as
+        ``min_snr``. ``snr`` is ``peak / bg_std``, so it is relative to the
+        *local* noise: a 30-count spot in a quiet corner scores 32 while a
+        200-count spot in a noisy region scores 24. Only an absolute cut can
+        express faintness, and this is it. Set it from the peak-value
+        histogram of a frame, not from a rule of thumb.
     max_edge_weight_frac : reject when more than this fraction of the
         thresholded signal sits on pixels touching the mask. See "Truncation"
         below. 0 disables the test.
@@ -699,6 +748,8 @@ def measure_roi(
         out["reject_reason"] = "spot truncated by mask"
     elif total < min_counts:
         out["reject_reason"] = "below min_counts"
+    elif min_peak_value > 0 and peak < min_peak_value:
+        out["reject_reason"] = "below min_peak_value"
     elif out["snr"] < min_snr:
         out["reject_reason"] = "below min_snr"
     else:
@@ -712,6 +763,8 @@ def build_peaklist(
     sim: pd.DataFrame,
     valid_mask: np.ndarray,
     boxsize: int,
+    *,
+    reject_overlapping: bool = False,
     **measure_kwargs,
 ) -> pd.DataFrame:
     """Measure every predicted position and return one row per spot.
@@ -721,6 +774,20 @@ def build_peaklist(
     saves. When this is scaled to a whole map, parallelise over *frames* with
     `laue.scan_pipeline._run_parallel` (joblib/loky) rather than over ROIs —
     `concurrent.futures.ProcessPoolExecutor` deadlocks under a Jupyter kernel.
+
+    Parameters
+    ----------
+    reject_overlapping : reject a ROI that overlaps the ROI of another
+        predicted spot, i.e. whose nearest predicted neighbour is closer than
+        ``2 * boxsize + 1``.
+
+        `flag_close_neighbours` records the same condition in its
+        ``contaminated`` column but deliberately drops nothing, and no caller
+        was applying it — so two ROIs sharing pixels were both measured and
+        both accepted, each centre of mass carrying part of the other spot.
+        The separation is compared against the boxsize *actually being
+        measured* rather than against whatever ``min_sep`` the flag was built
+        with, so the two cannot drift apart.
 
     Returns the simulation columns (h, k, l, Energy, …) joined to the
     measurement columns, rejected rows included and marked.
@@ -733,7 +800,20 @@ def build_peaklist(
     keep = [c for c in ("h", "k", "l", "Energy", "2theta", "chi",
                         "d_nearest", "n_neighbours", "contaminated")
             if c in sim.columns]
-    return pd.concat([sim[keep].reset_index(drop=True), meas], axis=1)
+    out = pd.concat([sim[keep].reset_index(drop=True), meas], axis=1)
+
+    if reject_overlapping:
+        xy = sim[["X", "Y"]].to_numpy(dtype=float)
+        if len(xy) > 1:
+            dist, _ = cKDTree(xy).query(xy, k=2)      # k=1 is the point itself
+            overlaps = dist[:, 1] < (2 * int(boxsize) + 1)
+        else:
+            overlaps = np.zeros(len(xy), dtype=bool)
+        hit = overlaps & out["accepted"].to_numpy()
+        out.loc[hit, "accepted"] = False
+        out.loc[hit, "reject_reason"] = "ROI overlaps another spot"
+
+    return out
 
 
 # ── Confirming the substrate prediction against the image ─────────────────────
