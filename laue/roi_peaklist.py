@@ -33,6 +33,7 @@ centre of mass.
 Pipeline
 --------
     simulate_pattern()        predicted spot positions, material + substrate
+    detect_foreign_spots()    real spots that are not the material's own
     forbidden_mask()          pixels excluded: detector gaps + substrate zones
     gaussian_background()     smooth fluorescence background over the frame
     build_peaklist()          one COM + moments per predicted material spot
@@ -927,6 +928,109 @@ def confirm_substrate_spots(
             "confirmed by it]")
     print(f"confirm_substrate_spots: {n} of {len(out)} predicted positions carry a "
           f"spot (snr >= {min_snr}, within {max_shift} px){note}")
+    return out
+
+
+# ── Masking what is there, rather than what is predicted ──────────────────────
+
+def detect_foreign_spots(
+    image: np.ndarray,
+    material_xy: np.ndarray,
+    valid_mask: np.ndarray | None = None,
+    *,
+    min_peak: float = 150.0,
+    keep_radius: float = 8.0,
+    neighbourhood: int = 11,
+) -> pd.DataFrame:
+    """Every real spot on the frame that is *not* one of the material's own.
+
+    The substrate simulation is only ever a mask generator: its job is to say
+    which pixels a material centre of mass must not see. Nothing about that job
+    requires knowing what the foreign spot is made of. Detecting the spots
+    directly does it without needing the right substrate, the right energy
+    range, or the right substrate orientation — only the material prediction,
+    which is needed anyway.
+
+    That matters because predicting the substrate is a losing game. Measured on
+    a GaN/sapphire frame, 161 of 531 real spots were explained by neither the
+    GaN prediction nor the confirmed 5-27 keV sapphire one. Raising the
+    substrate range to 55 keV covered 108 of them, but grew the candidate list
+    from 223 to 1922; the forbidden zones built from all of it rejected 12 more
+    material spots while cleaning only 4, because most foreign spots do not sit
+    on a material ROI in the first place. Detection reached zero unexplained
+    spots at the same cost in detector area:
+
+        simulated Al2O3, Emax=27   0.57% masked   155 accepted   132 clean
+        simulated Al2O3, Emax=55   0.99% masked   143 accepted   124 clean
+        detected foreign spots     1.03% masked   149 accepted   149 clean
+
+    Parameters
+    ----------
+    image : background-subtracted frame.
+    material_xy : (N, 2) predicted ``(X, Y)`` of the material. A detected spot
+        within *keep_radius* of one of these is assumed to BE that reflection
+        and is left alone, so a slightly displaced material spot can never mask
+        itself. This guard is not optional.
+    valid_mask : detector gaps and dead pixels, if any. Detections outside it
+        are dropped.
+    min_peak : counts above the local background for a local maximum to count
+        as a spot. Calibrate it the same way as ``min_peak_value``.
+    keep_radius : px. Must exceed the largest material displacement anywhere in
+        the map, not just on this frame — a spot that moves further than this
+        somewhere would be masked there. Check against the measured ``dR``.
+    neighbourhood : size of the maximum filter, in px. Two spots closer than
+        this are detected as one.
+
+    Returns
+    -------
+    DataFrame with ``X``, ``Y`` and ``peak``, ready for `forbidden_mask`.
+
+    The mask must still be built ONCE and reused
+    --------------------------------------------
+    Re-detecting per frame would make the forbidden zones move with the frame,
+    and the difference between two scan positions would then be partly the
+    mask. That is the one thing this measurement cannot afford. Build this on
+    the reference frame — or on a maximum projection over several frames, which
+    catches a foreign spot that is weak at the reference position — and then
+    hold it fixed for the whole map, exactly as with the simulated route.
+
+    What it will also mask
+    ----------------------
+    Anything real that is not a predicted material reflection: a second grain,
+    a twin, a powder ring, a detector artefact. If a second material grain is
+    signal you want, this is the wrong tool for it — raise *keep_radius* or add
+    its predicted positions to *material_xy*.
+    """
+    image = np.asarray(image)
+    material_xy = np.asarray(material_xy, dtype=float).reshape(-1, 2)
+
+    peak = ndi.maximum_filter(image, size=int(neighbourhood))
+    hits = (image >= peak) & (image > float(min_peak))
+    if valid_mask is not None:
+        hits &= np.asarray(valid_mask, dtype=bool)
+    if not hits.any():
+        return pd.DataFrame(columns=["X", "Y", "peak"])
+
+    # Centre of each plateau, from its bounding box: a flat-topped or saturated
+    # maximum covers several pixels and would otherwise be several detections.
+    labels, n = ndi.label(hits)
+    boxes = ndi.find_objects(labels)
+    ys = np.array([(b[0].start + b[0].stop - 1) / 2.0 for b in boxes])
+    xs = np.array([(b[1].start + b[1].stop - 1) / 2.0 for b in boxes])
+    vals = image[np.clip(np.round(ys).astype(int), 0, image.shape[0] - 1),
+                 np.clip(np.round(xs).astype(int), 0, image.shape[1] - 1)]
+
+    if len(material_xy):
+        d = cKDTree(material_xy).query(np.column_stack([xs, ys]))[0]
+        foreign = d > float(keep_radius)
+    else:
+        foreign = np.ones(len(xs), dtype=bool)
+
+    out = pd.DataFrame({"X": xs[foreign], "Y": ys[foreign],
+                        "peak": vals[foreign]}).reset_index(drop=True)
+    print(f"detect_foreign_spots: {n} spots above {min_peak:.0f} counts, "
+          f"{len(out)} of them farther than {keep_radius} px from a predicted "
+          f"material reflection")
     return out
 
 
