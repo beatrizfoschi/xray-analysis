@@ -87,6 +87,8 @@ def plot_overview(
     exclusion_half=None,
     ax=None,
     figsize=(11, 10),
+    perc_min = 1,
+    perc_max = 99.97, 
     show_rejected=True,
     max_boxes=2000,
     title=None,
@@ -105,7 +107,7 @@ def plot_overview(
     else:
         fig = ax.figure
 
-    vmin, vmax = _clim(image, valid_mask, 1.0, 99.97)
+    vmin, vmax = _clim(image, valid_mask, perc_min, perc_max)
     ax.imshow(image, cmap="Greys_r", vmin=vmin, vmax=vmax, interpolation="nearest")
 
     if blacklist_xy is not None and len(blacklist_xy) and exclusion_half is not None:
