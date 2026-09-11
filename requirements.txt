@@ -169,7 +169,7 @@ ipykernel==7.3.0 ; python_full_version >= '3.10'
     # via
     #   jupyterlab
     #   lauexplore
-ipympl==0.10.0
+ipympl==0.9.8
     # via lauexplore
 ipython==8.18.1 ; python_full_version < '3.10'
     # via
@@ -210,7 +210,9 @@ jinja2==3.1.6
     #   jupyterlab-server
     #   nbconvert
 joblib==1.5.3
-    # via scikit-learn
+    # via
+    #   scikit-learn
+    #   xray-analysis
 json5==0.15.0
     # via jupyterlab-server
 jsonpointer==3.0.0 ; python_full_version < '3.10'

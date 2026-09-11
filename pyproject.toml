@@ -55,4 +55,15 @@ exclude = ["*.tests", "*.tests.*"]
 # 58 MB sdist, which needs GTK3 dev headers to build. None of the LaueTools
 # modules this repo imports (dict_LaueTools, CrystalParameters, lauecore,
 # IOLaueTools, LaueGeometry) touch wx, so it is dropped there.
-override-dependencies = ["wxpython; sys_platform != 'linux'"]
+#
+# lauexplore depends on ipympl with no version pin, so the resolver takes
+# latest — currently 0.10.x, which requires the jupyter-matplotlib frontend
+# widget at semver ^0.12. Shared JupyterLab installs on synchrotron clusters
+# (e.g. ESRF) are centrally managed and commonly still serve 0.11.x, which a
+# kernel-side venv cannot upgrade on its own; the mismatch throws "Module
+# jupyter-matplotlib, version ^0.12 is not registered" at plot-widget render
+# time. ipympl 0.9.x requires ^0.11, which those installs already have.
+override-dependencies = [
+    "wxpython; sys_platform != 'linux'",
+    "ipympl<0.10",
+]
