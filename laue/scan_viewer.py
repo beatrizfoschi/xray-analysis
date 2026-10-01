@@ -76,7 +76,8 @@ def scan_viewer(
         Wavelength range (nm) used as normalization reference, passed to
         ``XEOL.from_h5`` as ``norm_zone``.
     sigmoid_cutoff, sigmoid_gain:
-        Parameters for ``skimage.exposure.adjust_sigmoid``.
+        Initial values for ``skimage.exposure.adjust_sigmoid``. Both can be
+        changed interactively with the "Cutoff" and "Gain" sliders.
     """
     h5_path  = Path(h5_path)
     img_source = Path(img_source)
@@ -92,7 +93,13 @@ def scan_viewer(
     motor_x   = scan.xpoints * 1e3          # mm → µm, shape (nbxpoints,)
     motor_y   = scan.ypoints * 1e3          # mm → µm, shape (nbypoints,)
 
-    def _load_image(file_index: int) -> np.ndarray:
+    # Cache da última imagem lida (já reescalada para [0, 1]): mexer nos sliders
+    # de contraste só reaplica o sigmoid, sem reler o arquivo do disco.
+    _raw_cache: dict = {"index": None, "img": None}
+
+    def _load_raw(file_index: int) -> np.ndarray:
+        if _raw_cache["index"] == file_index:
+            return _raw_cache["img"]
         if img_source.suffix in ('.h5', '.hdf5'):
             if h5_img_key is None:
                 raise ValueError("h5_img_key must be set when img_source is an HDF5 file.")
@@ -105,7 +112,13 @@ def scan_viewer(
         # range real dos dados — sem isso, cutoff/gain não têm efeito visível.
         raw = raw.astype(np.float64)
         raw = sk.exposure.rescale_intensity(raw, out_range=(0.0, 1.0))
-        return sk.exposure.adjust_sigmoid(raw, cutoff=sigmoid_cutoff, gain=sigmoid_gain)
+        _raw_cache["index"], _raw_cache["img"] = file_index, raw
+        return raw
+
+    def _load_image(file_index: int) -> np.ndarray:
+        return sk.exposure.adjust_sigmoid(
+            _load_raw(file_index), cutoff=cutoff_slider.value, gain=gain_slider.value
+        )
 
     def _calc_lims(im: np.ndarray, m: float = 3.0) -> tuple[float, float]:
         return im.mean() - m * im.std(), im.mean() + m * im.std()
@@ -115,6 +128,14 @@ def scan_viewer(
     )
     col_slider = widgets.IntSlider(
         value=scan.nbxpoints // 2, min=0, max=scan.nbxpoints - 1, step=1, description="Col"
+    )
+    cutoff_slider = widgets.FloatSlider(
+        value=sigmoid_cutoff, min=0.0, max=1.0, step=0.01,
+        description="Cutoff", readout_format=".2f",
+    )
+    gain_slider = widgets.FloatSlider(
+        value=sigmoid_gain, min=0.0, max=max(30.0, sigmoid_gain), step=0.5,
+        description="Gain", readout_format=".1f",
     )
 
     fig, (ax_map, ax_img) = plt.subplots(
@@ -200,9 +221,14 @@ def scan_viewer(
 
     row_slider.observe(lambda c: _update(c.new, col_slider.value), "value")
     col_slider.observe(lambda c: _update(row_slider.value, c.new), "value")
+    cutoff_slider.observe(lambda _: _update(row_slider.value, col_slider.value), "value")
+    gain_slider.observe(lambda _: _update(row_slider.value, col_slider.value), "value")
     fig.canvas.mpl_connect("key_press_event", _on_key)
 
-    ui = widgets.HBox([row_slider, col_slider])
+    ui = widgets.VBox([
+        widgets.HBox([row_slider, col_slider]),
+        widgets.HBox([cutoff_slider, gain_slider]),
+    ])
     display(ui)
     _update(row_slider.value, col_slider.value)
 
